@@ -227,7 +227,7 @@ size_t current_working_set_mb() {
 } // namespace
 
 int main() {
-    const auto temp_dir = std::filesystem::temp_directory_path() / L"komareader_formats_test";
+    const auto temp_dir = std::filesystem::temp_directory_path() / L"incunareader_formats_test";
     std::error_code ec;
     std::filesystem::remove_all(temp_dir, ec);
     std::filesystem::create_directories(temp_dir, ec);
@@ -235,7 +235,7 @@ int main() {
     const auto stream_cache = temp_dir / L"stream_cache";
     std::filesystem::create_directories(stream_cache, ec);
 
-    std::cout << "=== KomaReader 64-Bit Format Reader Verification ===\n";
+    std::cout << "=== Incuna Reader 64-Bit Format Reader Verification ===\n";
 
     // -------------------------------------------------------------------------
     // 1. Multi-page CBZ (12 pages, testing ZIP64 O(1), natural sort 1..12,

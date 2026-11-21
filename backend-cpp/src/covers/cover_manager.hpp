@@ -141,8 +141,9 @@ private:
     bool has_pending_pack_batch() const;
     bool try_windows_shell_cache(const std::wstring& path, CoverResult& out);
     CoverResult extract_from_comic(const std::wstring& path, int max_w = kCoverMaxWidth, int max_h = kCoverMaxHeight);
-    static std::wstring resolve_effective_path(const ComicRecord& comic);
-    static std::wstring resolve_effective_path_row(const UnindexedCoverRow& row);
+    static std::wstring resolve_effective_path(const std::string& path,
+                                               bool is_offline_pinned,
+                                               const std::string& offline_path);
 
     void worker_loop();
     void stop_pack_pipeline();

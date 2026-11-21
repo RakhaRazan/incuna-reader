@@ -34,13 +34,6 @@ int64_t unix_now_seconds() {
     return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
 }
 
-std::string to_lower_ascii(std::string s) {
-    for (char& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return s;
-}
-
 bool extract_comic_format(const std::string& filename, std::string& out_format) {
     const size_t dot = filename.rfind('.');
     if (dot == std::string::npos || dot + 1 >= filename.size()) return false;

@@ -203,9 +203,16 @@ target_compile_definitions(sqlite3 PUBLIC
     SQLITE_DQS=0
 )
 
-# Shared comic formats library (used by KomaReader.exe and automated verification tests)
+# Shared comic formats library (used by IncunaReader.exe and automated verification tests)
 add_library(koma_formats STATIC
+    src/utils/string_utils.hpp
+    src/utils/natural_sort.hpp
+    src/utils/natural_sort.cpp
     src/formats/comic_reader.hpp
+    src/formats/metadata_extractor.hpp
+    src/formats/metadata_extractor.cpp
+    src/formats/archive_io.hpp
+    src/formats/pdfium_runtime.hpp
     src/formats/image_utils.hpp
     src/formats/image_utils.cpp
     src/formats/pdf_reader.cpp
@@ -247,6 +254,8 @@ target_link_libraries(koma_formats PUBLIC
 # Core library (Database, 2-mode CoverManager, LibraryScanner & ReadDirectoryChangesW watcher)
 add_library(koma_core STATIC
     src/portable_paths.hpp
+    src/utils/win_system.hpp
+    src/utils/win_system.cpp
     src/win_dialogs.hpp
     src/win_dialogs.cpp
     src/win_jumplist.hpp
@@ -289,6 +298,7 @@ target_link_libraries(koma_core PUBLIC
 # Incuna Reader native WIN32 GUI executable (zero console window)
 add_executable(IncunaReader WIN32
     src/main.cpp
+    src/utils/json_helpers.hpp
     src/api/api_helpers.hpp
     src/api/library_routes.hpp
     src/api/library_routes.cpp

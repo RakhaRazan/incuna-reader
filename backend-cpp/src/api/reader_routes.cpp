@@ -1,7 +1,6 @@
 #include "api/reader_routes.hpp"
 
 #include <shellapi.h>
-#include <shlobj.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -11,12 +10,14 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include "api/api_helpers.hpp"
 #include "covers/cover_manager.hpp"
 #include "db/database.hpp"
-#include "formats/image_utils.hpp"
 #include "formats/reader_session.hpp"
 #include "portable_paths.hpp"
+#include "utils/json_helpers.hpp"
+#include "utils/natural_sort.hpp"
+#include "utils/string_utils.hpp"
+#include "utils/win_system.hpp"
 #include "watcher/library_scanner.hpp"
 #include "win_jumplist.hpp"
 
@@ -407,12 +408,6 @@ void register_reader_routes(httplib::Server& server, ReaderRouteContext ctx) {
         }
 
         const int64_t shelf_id = query_int64(req, "shelf_id", 0);
-        auto lower_wide = [](std::wstring s) {
-            for (wchar_t& c : s) {
-                if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
-            }
-            return s;
-        };
 
         std::vector<ComicRecord> candidates;
         if (shelf_id > 0) {
@@ -420,7 +415,7 @@ void register_reader_routes(httplib::Server& server, ReaderRouteContext ctx) {
         } else {
             const std::filesystem::path target_parent =
                 std::filesystem::path(utf8_to_wide(target.path)).parent_path().lexically_normal();
-            const std::wstring target_parent_lower = lower_wide(target_parent.wstring());
+            const std::wstring target_parent_lower = to_lower_wide(target_parent.wstring());
             const std::string parent_utf8 = wide_to_utf8(target_parent.wstring());
 
             auto raw = ctx.db.get_adjacent_candidates(0, parent_utf8);
@@ -428,7 +423,7 @@ void register_reader_routes(httplib::Server& server, ReaderRouteContext ctx) {
             for (auto& c : raw) {
                 const std::filesystem::path p =
                     std::filesystem::path(utf8_to_wide(c.path)).parent_path().lexically_normal();
-                if (lower_wide(p.wstring()) == target_parent_lower) {
+                if (to_lower_wide(p.wstring()) == target_parent_lower) {
                     candidates.push_back(std::move(c));
                 }
             }
@@ -496,65 +491,12 @@ void register_reader_routes(httplib::Server& server, ReaderRouteContext ctx) {
         }
 
         const std::wstring exe_w = ctx.paths.exe_path().wstring();
-        const std::wstring prog_id = L"IncunaReader.Comic";
-        const std::wstring prog_desc = L"Incuna Reader Comic Archive";
-        const std::wstring icon_val = L"\"" + exe_w + L"\",0";
-        const std::wstring cmd_val = L"\"" + exe_w + L"\" \"%1\"";
-
-        auto set_hkcu_sz = [](const std::wstring& subkey, const wchar_t* value_name, const std::wstring& data) -> LONG {
-            HKEY hkey = nullptr;
-            LONG rc = RegCreateKeyExW(
-                HKEY_CURRENT_USER, subkey.c_str(), 0, nullptr,
-                REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &hkey, nullptr);
-            if (rc != ERROR_SUCCESS) return rc;
-            const DWORD bytes = static_cast<DWORD>((data.size() + 1) * sizeof(wchar_t));
-            rc = RegSetValueExW(
-                hkey, value_name, 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(data.c_str()), bytes);
-            RegCloseKey(hkey);
-            return rc;
-        };
-
-        auto set_hkcu_none = [](const std::wstring& subkey, const wchar_t* value_name) -> LONG {
-            HKEY hkey = nullptr;
-            LONG rc = RegCreateKeyExW(
-                HKEY_CURRENT_USER, subkey.c_str(), 0, nullptr,
-                REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &hkey, nullptr);
-            if (rc != ERROR_SUCCESS) return rc;
-            rc = RegSetValueExW(hkey, value_name, 0, REG_NONE, nullptr, 0);
-            RegCloseKey(hkey);
-            return rc;
-        };
-
-        LONG rc = set_hkcu_sz(L"Software\\Classes\\" + prog_id, nullptr, prog_desc);
-        if (rc == ERROR_SUCCESS) {
-            rc = set_hkcu_sz(L"Software\\Classes\\" + prog_id + L"\\DefaultIcon", nullptr, icon_val);
-        }
-        if (rc == ERROR_SUCCESS) {
-            rc = set_hkcu_sz(L"Software\\Classes\\" + prog_id + L"\\shell\\open\\command", nullptr, cmd_val);
-        }
-        if (rc != ERROR_SUCCESS) {
-            send_error(res, "Failed to write HKCU ProgID registry keys", 500);
+        std::vector<std::string> registered_exts;
+        std::string err;
+        if (!register_file_type_associations(exe_w, include_pdf, registered_exts, err)) {
+            send_error(res, err, 500);
             return;
         }
-
-        std::vector<std::wstring> exts = {L".cbz", L".cbr", L".cb7", L".cbt", L".epub"};
-        if (include_pdf) {
-            exts.push_back(L".pdf");
-        }
-
-        nlohmann::json registered_exts = nlohmann::json::array();
-        for (const auto& ext : exts) {
-            const std::wstring ext_key = L"Software\\Classes\\" + ext;
-            if (set_hkcu_sz(ext_key, nullptr, prog_id) != ERROR_SUCCESS) {
-                send_error(res, "Failed to register extension in HKCU", 500);
-                return;
-            }
-            set_hkcu_none(ext_key + L"\\OpenWithProgids", prog_id.c_str());
-            registered_exts.push_back(wide_to_utf8(ext));
-        }
-
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
 
         send_json(res, {
             {"registered", true},
@@ -573,15 +515,7 @@ void register_reader_routes(httplib::Server& server, ReaderRouteContext ctx) {
             return;
         }
         const bool active = body["active"].get<bool>();
-        bool applied = false;
-        if (ctx.set_keep_awake) {
-            applied = ctx.set_keep_awake(active);
-        } else {
-            const EXECUTION_STATE flags = active
-                ? (ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
-                : ES_CONTINUOUS;
-            applied = (SetThreadExecutionState(flags) != 0);
-        }
+        const bool applied = ctx.set_keep_awake ? ctx.set_keep_awake(active) : set_thread_keep_awake(active);
         send_json(res, {{"active", active}, {"applied", applied}});
     }));
 

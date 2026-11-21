@@ -11,7 +11,14 @@
 #include <vector>
 
 #include <httplib.h>
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4005)
+#endif
 #include <webview/webview.h>
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 #include "api/library_routes.hpp"
 #include "api/reader_routes.hpp"
@@ -20,6 +27,7 @@
 #include "db/database.hpp"
 #include "formats/reader_session.hpp"
 #include "portable_paths.hpp"
+#include "utils/win_system.hpp"
 #include "watcher/library_scanner.hpp"
 #include "win_dialogs.hpp"
 #include "win_jumplist.hpp"
@@ -99,13 +107,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR lpCm
         server.set_mount_point("/", koma::wide_to_utf8(dist_dir.wstring()));
     }
 
-    struct FullscreenState {
-        bool active = false;
-        LONG saved_style = 0;
-        LONG saved_ex_style = 0;
-        WINDOWPLACEMENT saved_placement{sizeof(WINDOWPLACEMENT)};
-    };
-    auto fs_state = std::make_shared<FullscreenState>();
+    auto fullscreen = std::make_shared<koma::WinFullscreenController>();
 
     koma::api::register_library_routes(server, {db, scanner, cloud_client, paths, refresh_jumplist});
     koma::api::register_reader_routes(server, {
@@ -114,51 +116,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR lpCm
         [&]() { return run_on_ui([](HWND owner) { return koma::PickFolderDialog(owner); }); },
         [&]() { return run_on_ui([](HWND owner) { return koma::PickComicFilesDialog(owner); }); },
         [&](bool active) {
-            return run_on_ui([active](HWND) {
-                const EXECUTION_STATE flags = active
-                    ? (ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
-                    : ES_CONTINUOUS;
-                return SetThreadExecutionState(flags) != 0;
-            });
+            return run_on_ui([active](HWND) { return koma::set_thread_keep_awake(active); });
         },
-        [&, fs_state](bool enable) {
-            return run_on_ui([enable, fs_state](HWND hwnd) -> bool {
-                if (!hwnd) return false;
-                if (enable && !fs_state->active) {
-                    fs_state->saved_style = GetWindowLongW(hwnd, GWL_STYLE);
-                    fs_state->saved_ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                    fs_state->saved_placement.length = sizeof(WINDOWPLACEMENT);
-                    GetWindowPlacement(hwnd, &fs_state->saved_placement);
-
-                    MONITORINFO mi{};
-                    mi.cbSize = sizeof(mi);
-                    if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
-                        SetWindowLongW(hwnd, GWL_STYLE, fs_state->saved_style & ~WS_OVERLAPPEDWINDOW);
-                        SetWindowLongW(
-                            hwnd, GWL_EXSTYLE,
-                            fs_state->saved_ex_style & ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
-                        SetWindowPos(
-                            hwnd,
-                            HWND_TOP,
-                            mi.rcMonitor.left,
-                            mi.rcMonitor.top,
-                            mi.rcMonitor.right - mi.rcMonitor.left,
-                            mi.rcMonitor.bottom - mi.rcMonitor.top,
-                            SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-                        fs_state->active = true;
-                    }
-                } else if (!enable && fs_state->active) {
-                    SetWindowLongW(hwnd, GWL_STYLE, fs_state->saved_style);
-                    SetWindowLongW(hwnd, GWL_EXSTYLE, fs_state->saved_ex_style);
-                    SetWindowPlacement(hwnd, &fs_state->saved_placement);
-                    SetWindowPos(
-                        hwnd,
-                        nullptr,
-                        0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-                    fs_state->active = false;
-                }
-                return fs_state->active;
+        [&, fullscreen](bool enable) {
+            return run_on_ui([enable, fullscreen](HWND hwnd) {
+                return fullscreen->set_fullscreen(hwnd, enable);
             });
         }
     });
@@ -203,7 +165,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR lpCm
     main_hwnd.store(nullptr);
 
     // Always restore default OS display/sleep power state on shutdown
-    SetThreadExecutionState(ES_CONTINUOUS);
+    koma::set_thread_keep_awake(false);
 
     server.stop();
     if (server_thread.joinable()) server_thread.join();

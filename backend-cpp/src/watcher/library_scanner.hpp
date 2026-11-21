@@ -46,9 +46,6 @@ public:
     LibraryScanner(const LibraryScanner&) = delete;
     LibraryScanner& operator=(const LibraryScanner&) = delete;
 
-    void set_cover_manager(CoverManager* cover_manager);
-    void set_settings(SettingsManager* settings);
-
     // Auto-remap drive-letter prefixes when portable folder + comic library move to a new drive.
     int64_t auto_remap_drives();
 

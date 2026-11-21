@@ -452,23 +452,13 @@ CoverResult CoverManager::extract_from_comic(const std::wstring& path, int max_w
     return res;
 }
 
-std::wstring CoverManager::resolve_effective_path(const ComicRecord& comic) {
-    std::wstring effective_path = utf8_to_wide(comic.path);
-    if (comic.is_offline_pinned && !comic.offline_path.empty()) {
+std::wstring CoverManager::resolve_effective_path(const std::string& path,
+                                                  bool is_offline_pinned,
+                                                  const std::string& offline_path) {
+    std::wstring effective_path = utf8_to_wide(path);
+    if (is_offline_pinned && !offline_path.empty()) {
         std::error_code ec;
-        const std::wstring offline_w = utf8_to_wide(comic.offline_path);
-        if (std::filesystem::exists(offline_w, ec)) {
-            effective_path = offline_w;
-        }
-    }
-    return effective_path;
-}
-
-std::wstring CoverManager::resolve_effective_path_row(const UnindexedCoverRow& row) {
-    std::wstring effective_path = utf8_to_wide(row.path);
-    if (row.is_offline_pinned && !row.offline_path.empty()) {
-        std::error_code ec;
-        const std::wstring offline_w = utf8_to_wide(row.offline_path);
+        const std::wstring offline_w = utf8_to_wide(offline_path);
         if (std::filesystem::exists(offline_w, ec)) {
             effective_path = offline_w;
         }
@@ -506,7 +496,7 @@ CoverResult CoverManager::get_cover(int64_t comic_id) {
     }
 
     // Resolve effective path (prefer local offline_path if pinned and exists)
-    std::wstring effective_path = resolve_effective_path(comic);
+    std::wstring effective_path = resolve_effective_path(comic.path, comic.is_offline_pinned, comic.offline_path);
 
     // 3. In ram_only mode, check Windows Explorer thumbnail cache (SIIGBF_INCACHEONLY)
     if (!persistent) {
@@ -750,7 +740,7 @@ void CoverManager::pack_reader_loop(uint64_t gen) {
 
             RawCoverWork work;
             work.comic_id = row.id;
-            work.file_path = resolve_effective_path_row(row);
+            work.file_path = resolve_effective_path(row.path, row.is_offline_pinned, row.offline_path);
             work.generation = gen;
 
             // Sequential 1-thread HDD read for CBZ/EPUB Page 0 raw bytes (zero CPU decode on disk thread)

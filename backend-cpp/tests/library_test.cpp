@@ -112,9 +112,9 @@ bool create_sample_cbz(const std::filesystem::path& path, uint8_t r, uint8_t g, 
 } // namespace
 
 int main() {
-    std::cout << "=== KomaReader Library, Watcher & 2-Mode Cover Verification ===\n";
+    std::cout << "=== Incuna Reader Library, Watcher & 2-Mode Cover Verification ===\n";
 
-    const auto root = std::filesystem::temp_directory_path() / L"komareader_library_test";
+    const auto root = std::filesystem::temp_directory_path() / L"incunareader_library_test";
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     const auto comics_dir = root / L"comics";

@@ -1,4 +1,5 @@
 #include "formats/image_utils.hpp"
+#include "utils/string_utils.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -26,13 +27,6 @@
 namespace koma {
 
 namespace {
-
-std::string to_lower_ascii(std::string s) {
-    for (char& c : s) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return s;
-}
 
 bool is_webp_magic(const uint8_t* data, size_t size) {
     return size >= 12 &&
@@ -90,63 +84,9 @@ bool is_supported_image_filename_wide(const std::wstring& filename) {
     if (base.empty() || base[0] == L'.') return false;
     const size_t dot = base.find_last_of(L'.');
     if (dot == std::wstring::npos) return false;
-    std::wstring ext = base.substr(dot);
-    for (wchar_t& c : ext) {
-        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
-    }
+    const std::wstring ext = to_lower_wide(base.substr(dot));
     return ext == L".jpg" || ext == L".jpeg" || ext == L".png" ||
            ext == L".gif" || ext == L".bmp"  || ext == L".webp";
-}
-
-bool natural_less(const std::string& a, const std::string& b) {
-    size_t ia = 0;
-    size_t ib = 0;
-    const size_t na = a.size();
-    const size_t nb = b.size();
-
-    while (ia < na && ib < nb) {
-        const unsigned char ca = static_cast<unsigned char>(a[ia]);
-        const unsigned char cb = static_cast<unsigned char>(b[ib]);
-
-        if (std::isdigit(ca) && std::isdigit(cb)) {
-            // Skip leading zeros while tracking run length
-            size_t za = ia;
-            while (za < na && a[za] == '0') ++za;
-            size_t zb = ib;
-            while (zb < nb && b[zb] == '0') ++zb;
-
-            size_t ea = za;
-            while (ea < na && std::isdigit(static_cast<unsigned char>(a[ea]))) ++ea;
-            size_t eb = zb;
-            while (eb < nb && std::isdigit(static_cast<unsigned char>(b[eb]))) ++eb;
-
-            const size_t len_a = ea - za;
-            const size_t len_b = eb - zb;
-            if (len_a != len_b) {
-                return len_a < len_b;
-            }
-            for (size_t k = 0; k < len_a; ++k) {
-                if (a[za + k] != b[zb + k]) {
-                    return a[za + k] < b[zb + k];
-                }
-            }
-            // Equal numeric value: prefer fewer leading zeros if different
-            if ((za - ia) != (zb - ib)) {
-                return (za - ia) < (zb - ib);
-            }
-            ia = ea;
-            ib = eb;
-        } else {
-            const char la = static_cast<char>(std::tolower(ca));
-            const char lb = static_cast<char>(std::tolower(cb));
-            if (la != lb) {
-                return la < lb;
-            }
-            ++ia;
-            ++ib;
-        }
-    }
-    return ia == na && ib < nb;
 }
 
 DecodedImage decode_image_bytes(const uint8_t* data, size_t size) {

@@ -1,10 +1,5 @@
 #include "api/library_routes.hpp"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
@@ -18,132 +13,79 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include "api/api_helpers.hpp"
 #include "cloud/cloud_client.hpp"
 #include "db/database.hpp"
 #include "portable_paths.hpp"
+#include "utils/json_helpers.hpp"
+#include "utils/string_utils.hpp"
+#include "utils/win_system.hpp"
 #include "watcher/library_scanner.hpp"
 
 namespace koma::api {
 
 namespace {
 
-void unpin_offline(Database& db, int64_t comic_id, httplib::Response& res) {
-    ComicRecord comic;
-    if (!db.get_comic(comic_id, comic)) {
-        send_error(res, "Comic not found", 404);
-        return;
-    }
-    if (!comic.offline_path.empty()) {
-        std::error_code del_ec;
-        std::filesystem::remove(utf8_to_wide(comic.offline_path), del_ec);
-    }
-    db.update_comic_offline_pin(comic_id, false, "");
-    send_json(res, {{"id", comic_id}, {"is_offline_pinned", false}, {"offline_path", ""}});
-}
-
-std::wstring to_lower_wide(std::wstring s) {
-    for (wchar_t& c : s) {
-        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
-    }
-    return s;
-}
-
-std::wstring get_env_wide(const wchar_t* name) {
-    DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
-    if (needed == 0) return {};
-    std::wstring buf(needed, L'\0');
-    DWORD written = GetEnvironmentVariableW(name, buf.data(), needed);
-    if (written == 0) return {};
-    if (!buf.empty() && buf.back() == L'\0') buf.pop_back();
-    buf.resize(written);
-    return buf;
-}
-
-std::wstring read_hkcu_reg_string(const wchar_t* subkey, const wchar_t* value_name) {
-    DWORD size_bytes = 0;
-    if (RegGetValueW(HKEY_CURRENT_USER, subkey, value_name, RRF_RT_REG_SZ, nullptr, nullptr, &size_bytes) != ERROR_SUCCESS ||
-        size_bytes <= sizeof(wchar_t)) {
-        return {};
-    }
-    std::wstring buf(size_bytes / sizeof(wchar_t), L'\0');
-    if (RegGetValueW(HKEY_CURRENT_USER, subkey, value_name, RRF_RT_REG_SZ, nullptr, buf.data(), &size_bytes) != ERROR_SUCCESS) {
-        return {};
-    }
-    while (!buf.empty() && buf.back() == L'\0') buf.pop_back();
-    return buf;
-}
-
-struct CloudSourceCandidate {
-    std::string provider;
-    std::string name;
-    std::wstring path;
+enum class OfflinePinOutcome {
+    Ok,
+    NotFound,
+    CopyFailed
 };
 
-nlohmann::json discover_cloud_sources(Database& db) {
-    std::vector<CloudSourceCandidate> candidates;
+OfflinePinOutcome set_comic_offline_pin(Database& db,
+                                        const std::filesystem::path& cache_dir,
+                                        int64_t comic_id,
+                                        bool want_pin,
+                                        bool skip_if_already_pinned,
+                                        std::string& out_offline_path,
+                                        std::string& out_error) {
+    out_offline_path.clear();
+    out_error.clear();
 
-    const std::wstring onedrive = get_env_wide(L"OneDrive");
-    if (!onedrive.empty()) candidates.push_back({"onedrive", "OneDrive", onedrive});
-
-    const std::wstring onedrive_biz = get_env_wide(L"OneDriveCommercial");
-    if (!onedrive_biz.empty()) candidates.push_back({"onedrive_commercial", "OneDrive (Work/School)", onedrive_biz});
-
-    const std::wstring onedrive_pers = get_env_wide(L"OneDriveConsumer");
-    if (!onedrive_pers.empty()) candidates.push_back({"onedrive", "OneDrive (Personal)", onedrive_pers});
-
-    const std::wstring reg_od_pers = read_hkcu_reg_string(
-        L"Software\\Microsoft\\OneDrive\\Accounts\\Personal", L"UserFolder");
-    if (!reg_od_pers.empty()) candidates.push_back({"onedrive", "OneDrive (Personal)", reg_od_pers});
-
-    const std::wstring reg_od_biz = read_hkcu_reg_string(
-        L"Software\\Microsoft\\OneDrive\\Accounts\\Business1", L"UserFolder");
-    if (!reg_od_biz.empty()) candidates.push_back({"onedrive_commercial", "OneDrive (Work/School)", reg_od_biz});
-
-    const std::wstring userprofile = get_env_wide(L"USERPROFILE");
-    if (!userprofile.empty()) {
-        const std::filesystem::path up(userprofile);
-        candidates.push_back({"onedrive", "OneDrive", (up / L"OneDrive").wstring()});
-        candidates.push_back({"google_drive", "Google Drive", (up / L"Google Drive").wstring()});
-        candidates.push_back({"google_drive", "Google Drive", (up / L"My Drive").wstring()});
-        candidates.push_back({"dropbox", "Dropbox", (up / L"Dropbox").wstring()});
-        candidates.push_back({"dropbox", "Dropbox (Personal)", (up / L"Dropbox (Personal)").wstring()});
-        candidates.push_back({"dropbox", "Dropbox (Business)", (up / L"Dropbox (Business)").wstring()});
+    ComicRecord comic;
+    if (!db.get_comic(comic_id, comic)) {
+        out_error = "Comic not found";
+        return OfflinePinOutcome::NotFound;
     }
 
-    candidates.push_back({"google_drive", "Google Drive (G:)", L"G:\\My Drive"});
-
-    std::unordered_set<std::wstring> watched_lower;
-    for (const auto& wf : db.get_watched_folders()) {
-        std::error_code ec;
-        std::filesystem::path p(utf8_to_wide(wf.path));
-        auto canon = std::filesystem::weakly_canonical(p, ec);
-        watched_lower.insert(to_lower_wide((ec ? p : canon).wstring()));
-    }
-
-    std::unordered_set<std::wstring> seen_paths;
-    nlohmann::json arr = nlohmann::json::array();
     std::error_code ec;
-    for (const auto& c : candidates) {
-        if (c.path.empty()) continue;
-        std::filesystem::path p(c.path);
-        if (!std::filesystem::is_directory(p, ec) || ec) {
-            ec.clear();
-            continue;
+    if (!want_pin) {
+        if (!comic.offline_path.empty()) {
+            std::filesystem::remove(utf8_to_wide(comic.offline_path), ec);
         }
-        auto canon = std::filesystem::weakly_canonical(p, ec);
-        const std::filesystem::path& final_p = ec ? p : canon;
-        const std::wstring key = to_lower_wide(final_p.wstring());
-        if (!seen_paths.insert(key).second) continue;
-
-        arr.push_back({
-            {"provider", c.provider},
-            {"name", c.name},
-            {"path", wide_to_utf8(final_p.wstring())},
-            {"already_added", watched_lower.count(key) > 0}
-        });
+        db.update_comic_offline_pin(comic_id, false, "");
+        return OfflinePinOutcome::Ok;
     }
-    return arr;
+
+    if (skip_if_already_pinned && comic.is_offline_pinned && !comic.offline_path.empty() &&
+        std::filesystem::exists(utf8_to_wide(comic.offline_path), ec)) {
+        out_offline_path = comic.offline_path;
+        return OfflinePinOutcome::Ok;
+    }
+
+    const std::filesystem::path src(utf8_to_wide(comic.path));
+    const std::filesystem::path dst =
+        cache_dir / (L"comic_" + std::to_wstring(comic_id) + L"_" + src.filename().wstring());
+    std::filesystem::create_directories(cache_dir, ec);
+    std::error_code copy_ec;
+    std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, copy_ec);
+    if (copy_ec) {
+        out_error = "Failed to copy file to offline_cache: " + copy_ec.message();
+        return OfflinePinOutcome::CopyFailed;
+    }
+
+    out_offline_path = wide_to_utf8(dst.wstring());
+    db.update_comic_offline_pin(comic_id, true, out_offline_path);
+    return OfflinePinOutcome::Ok;
+}
+
+void unpin_offline(Database& db, const std::filesystem::path& cache_dir, int64_t comic_id, httplib::Response& res) {
+    std::string offline_path;
+    std::string err;
+    if (set_comic_offline_pin(db, cache_dir, comic_id, false, false, offline_path, err) == OfflinePinOutcome::NotFound) {
+        send_error(res, err, 404);
+        return;
+    }
+    send_json(res, {{"id", comic_id}, {"is_offline_pinned", false}, {"offline_path", ""}});
 }
 
 struct BatchPinManager {
@@ -286,7 +228,7 @@ void register_library_routes(httplib::Server& server, LibraryRouteContext ctx) {
 
     // ---- Storage: Cloud Discovery, Batch Offline Pinning & Cache Stats ----
     server.Get("/api/storage/cloud-sources", guarded([ctx](const httplib::Request&, httplib::Response& res) {
-        send_json(res, {{"sources", discover_cloud_sources(ctx.db)}});
+        send_json(res, {{"sources", discover_local_cloud_sources(ctx.db)}});
     }));
 
     server.Get("/api/storage/offline-stats", guarded([ctx, batch_pin](const httplib::Request&, httplib::Response& res) {
@@ -411,39 +353,15 @@ void register_library_routes(httplib::Server& server, LibraryRouteContext ctx) {
         const std::filesystem::path cache_dir = ctx.paths.offline_cache_dir();
         Database& db_ref = ctx.db;
         batch_pin->worker = std::thread([batch_pin, &db_ref, cache_dir, ids = std::move(ids), want_pin]() {
-            std::error_code ec;
-            if (want_pin) {
-                std::filesystem::create_directories(cache_dir, ec);
-            }
             for (int64_t comic_id : ids) {
-                ComicRecord comic;
-                if (!db_ref.get_comic(comic_id, comic)) {
-                    ++batch_pin->failed;
-                    continue;
-                }
-                if (!want_pin) {
-                    if (!comic.offline_path.empty()) {
-                        std::filesystem::remove(utf8_to_wide(comic.offline_path), ec);
-                    }
-                    db_ref.update_comic_offline_pin(comic_id, false, "");
+                std::string offline_path;
+                std::string err;
+                const auto outcome = set_comic_offline_pin(
+                    db_ref, cache_dir, comic_id, want_pin, /*skip_if_already_pinned=*/true, offline_path, err);
+                if (outcome == OfflinePinOutcome::Ok) {
                     ++batch_pin->completed;
                 } else {
-                    if (comic.is_offline_pinned && !comic.offline_path.empty() &&
-                        std::filesystem::exists(utf8_to_wide(comic.offline_path), ec)) {
-                        ++batch_pin->completed;
-                        continue;
-                    }
-                    const std::filesystem::path src(utf8_to_wide(comic.path));
-                    const std::filesystem::path dst =
-                        cache_dir / (L"comic_" + std::to_wstring(comic_id) + L"_" + src.filename().wstring());
-                    std::error_code copy_ec;
-                    std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, copy_ec);
-                    if (copy_ec) {
-                        ++batch_pin->failed;
-                    } else {
-                        db_ref.update_comic_offline_pin(comic_id, true, wide_to_utf8(dst.wstring()));
-                        ++batch_pin->completed;
-                    }
+                    ++batch_pin->failed;
                 }
             }
             batch_pin->running.store(false);
@@ -636,36 +554,28 @@ void register_library_routes(httplib::Server& server, LibraryRouteContext ctx) {
         }
 
         if (!want_pin) {
-            unpin_offline(ctx.db, comic_id, res);
+            unpin_offline(ctx.db, ctx.paths.offline_cache_dir(), comic_id, res);
             return;
         }
 
-        ComicRecord comic;
-        if (!ctx.db.get_comic(comic_id, comic)) {
-            send_error(res, "Comic not found", 404);
+        std::string offline_utf8;
+        std::string err;
+        const auto outcome = set_comic_offline_pin(
+            ctx.db, ctx.paths.offline_cache_dir(), comic_id, true, false, offline_utf8, err);
+        if (outcome == OfflinePinOutcome::NotFound) {
+            send_error(res, err, 404);
             return;
         }
-
-        const std::filesystem::path src(utf8_to_wide(comic.path));
-        const std::filesystem::path dst =
-            ctx.paths.offline_cache_dir() / (L"comic_" + std::to_wstring(comic_id) + L"_" + src.filename().wstring());
-
-        std::error_code copy_ec;
-        std::filesystem::create_directories(ctx.paths.offline_cache_dir(), copy_ec);
-        std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, copy_ec);
-        if (copy_ec) {
-            send_error(res, "Failed to copy file to offline_cache: " + copy_ec.message(), 500);
+        if (outcome == OfflinePinOutcome::CopyFailed) {
+            send_error(res, err, 500);
             return;
         }
-
-        const std::string offline_utf8 = wide_to_utf8(dst.wstring());
-        ctx.db.update_comic_offline_pin(comic_id, true, offline_utf8);
         send_json(res, {{"id", comic_id}, {"is_offline_pinned", true}, {"offline_path", offline_utf8}});
     }));
 
     server.Delete(R"(/api/comics/(\d+)/pin-offline)", guarded([ctx](const httplib::Request& req, httplib::Response& res) {
         const int64_t comic_id = std::stoll(req.matches[1].str());
-        unpin_offline(ctx.db, comic_id, res);
+        unpin_offline(ctx.db, ctx.paths.offline_cache_dir(), comic_id, res);
     }));
 
     server.Post(R"(/api/comics/(\d+)/hidden)", guarded([ctx](const httplib::Request& req, httplib::Response& res) {
@@ -751,36 +661,16 @@ void register_library_routes(httplib::Server& server, LibraryRouteContext ctx) {
             updated = ctx.db.batch_remove_shelf(shelf_id, ids);
         } else if (action == "pin_offline") {
             const bool want_pin = body.value("pinned", true);
-            std::error_code ec;
-            if (want_pin) {
-                std::filesystem::create_directories(ctx.paths.offline_cache_dir(), ec);
-            }
+            const std::filesystem::path cache_dir = ctx.paths.offline_cache_dir();
             for (int64_t comic_id : ids) {
-                ComicRecord comic;
-                if (!ctx.db.get_comic(comic_id, comic)) {
-                    ++failed;
-                    continue;
-                }
-                if (!want_pin) {
-                    if (!comic.offline_path.empty()) {
-                        std::filesystem::remove(utf8_to_wide(comic.offline_path), ec);
-                    }
-                    ctx.db.update_comic_offline_pin(comic_id, false, "");
+                std::string offline_path;
+                std::string err;
+                const auto outcome = set_comic_offline_pin(
+                    ctx.db, cache_dir, comic_id, want_pin, /*skip_if_already_pinned=*/false, offline_path, err);
+                if (outcome == OfflinePinOutcome::Ok) {
                     ++updated;
                 } else {
-                    const std::filesystem::path src(utf8_to_wide(comic.path));
-                    const std::filesystem::path dst =
-                        ctx.paths.offline_cache_dir() /
-                        (L"comic_" + std::to_wstring(comic_id) + L"_" + src.filename().wstring());
-                    std::error_code copy_ec;
-                    std::filesystem::copy_file(
-                        src, dst, std::filesystem::copy_options::overwrite_existing, copy_ec);
-                    if (copy_ec) {
-                        ++failed;
-                    } else {
-                        ctx.db.update_comic_offline_pin(comic_id, true, wide_to_utf8(dst.wstring()));
-                        ++updated;
-                    }
+                    ++failed;
                 }
             }
         } else {

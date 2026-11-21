@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "formats/metadata_extractor.hpp"
+
 namespace koma {
 
 enum class ComicFormat {
@@ -79,24 +81,6 @@ std::unique_ptr<ComicReader> create_comic_reader(
 
 // Detects ComicFormat from filesystem path.
 ComicFormat detect_comic_format(const std::wstring& path);
-
-struct ComicMetadata {
-    std::string series;
-    std::string author;
-    std::string tags;
-    std::string language;
-
-    bool empty() const {
-        return series.empty() && author.empty() && tags.empty() && language.empty();
-    }
-};
-
-// Fast metadata extraction (<1ms for PDF via FPDF_GetMetaText; ZIP64 O(1) CD or libarchive for ComicInfo.xml).
-bool extract_pdf_metadata(const std::wstring& path, ComicMetadata& out);
-bool extract_archive_metadata(const std::wstring& path, ComicMetadata& out);
-
-// Fallback filename parser: extracts [Author/Circle] and (Tag/Event) from filename stems when internal metadata is empty.
-void parse_filename_metadata(const std::string& filename_stem, ComicMetadata& in_out);
 
 // Fast O(1) ZIP64 extraction of Page 0 raw image bytes for sequential HDD cover-pack pipelines
 // (returns false for non-ZIP64 formats like PDF/CBR/7Z so caller falls back to ComicReader).

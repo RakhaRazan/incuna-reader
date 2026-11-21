@@ -192,7 +192,6 @@ public:
     std::vector<ComicRecord> get_recent_comics(int limit = 8);
     std::vector<ComicRecord> get_continue_reading(int limit = 10, bool include_hidden = false);
     bool get_random_unread_comic(const RandomComicQuery& q, ComicRecord& out);
-    std::vector<ComicRecord> get_comics_needing_cover_pack();
     std::vector<UnindexedCoverRow> get_unindexed_covers_chunk(int limit = 1000, const std::string& after_path = "");
     int64_t count_unindexed_covers();
     LibraryPageResult query_library(const LibraryQuery& q);
@@ -208,7 +207,6 @@ public:
                                int page_count,
                                const std::string& status,
                                int is_favorite_opt /* -1 = keep */);
-    bool update_comic_cover_pack(int64_t id, int64_t offset, int64_t size);
     bool batch_update_comic_cover_pack(const std::vector<CoverPackUpdate>& updates);
     bool reset_all_cover_pack_offsets();
     bool update_comic_offline_pin(int64_t id, bool pinned, const std::string& offline_path);
@@ -234,7 +232,6 @@ public:
 
     // Smartviews
     std::vector<SmartViewRecord> get_smartviews();
-    bool get_smartview_by_slug(const std::string& slug, SmartViewRecord& out);
     bool create_smartview(const std::string& slug,
                           const std::string& name,
                           const std::string& query_json,

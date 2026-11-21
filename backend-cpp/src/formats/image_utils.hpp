@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "formats/comic_reader.hpp"
+#include "utils/natural_sort.hpp"
 
 namespace koma {
 
@@ -22,9 +23,6 @@ struct DecodedImage {
 // Returns true if filename has a supported image extension (.jpg, .jpeg, .png, .gif, .bmp, .webp).
 bool is_supported_image_filename(const std::string& filename);
 bool is_supported_image_filename_wide(const std::wstring& filename);
-
-// Natural sort comparator (case-insensitive, numeric runs compared numerically: 1, 2, ..., 10).
-bool natural_less(const std::string& a, const std::string& b);
 
 // Decodes JPEG, PNG, GIF, BMP (stb_image) or WEBP (libwebp) into RGBA8888.
 DecodedImage decode_image_bytes(const uint8_t* data, size_t size);

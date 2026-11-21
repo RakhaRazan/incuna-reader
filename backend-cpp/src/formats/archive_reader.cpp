@@ -1,14 +1,10 @@
+#include "formats/archive_io.hpp"
 #include "formats/comic_reader.hpp"
 #include "formats/image_utils.hpp"
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "utils/string_utils.hpp"
 
 #include <archive.h>
 #include <archive_entry.h>
-#include <zlib.h>
 
 #include <algorithm>
 #include <cctype>
@@ -28,102 +24,23 @@ namespace koma {
 
 namespace {
 
+using detail::Win64ArchiveStream;
+using detail::inflate_raw_deflate;
+using detail::la_win64_close_cb;
+using detail::la_win64_read_cb;
+using detail::la_win64_seek_cb;
+using detail::la_win64_skip_cb;
+using detail::normalize_zip_path;
+using detail::parse_zip64_extra_fields;
+using detail::read_le16;
+using detail::read_le32;
+using detail::read_le64;
+using detail::read_zip64_central_directory;
+using detail::read_zip_entry_bytes;
+using detail::win64_read_at;
+
 // Threshold above which solid .7z/.cbr archives progressively spill to disk stream_cache
 constexpr int64_t kSolidStreamCacheThresholdBytes = 1024LL * 1024LL * 1024LL; // 1 GB
-
-inline uint16_t read_le16(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
-}
-
-inline uint32_t read_le32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-inline uint64_t read_le64(const uint8_t* p) {
-    return static_cast<uint64_t>(read_le32(p)) |
-           (static_cast<uint64_t>(read_le32(p + 4)) << 32);
-}
-
-std::wstring to_lower_wide(std::wstring s) {
-    for (wchar_t& c : s) {
-        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
-    }
-    return s;
-}
-
-bool win64_read_at(HANDLE h, int64_t offset, uint8_t* buf, size_t len) {
-    if (h == INVALID_HANDLE_VALUE || offset < 0) return false;
-    if (len == 0) return true;
-
-    LARGE_INTEGER li{};
-    li.QuadPart = offset;
-    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) {
-        return false;
-    }
-
-    size_t total = 0;
-    while (total < len) {
-        const DWORD to_read = static_cast<DWORD>(std::min<size_t>(len - total, 16 * 1024 * 1024));
-        DWORD got = 0;
-        if (!ReadFile(h, buf + total, to_read, &got, nullptr) || got == 0) {
-            return false;
-        }
-        total += got;
-    }
-    return true;
-}
-
-bool inflate_raw_deflate(const uint8_t* src, size_t src_len,
-                         uint64_t expected_uncompressed,
-                         std::vector<uint8_t>& dst) {
-    z_stream zs{};
-    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) {
-        return false;
-    }
-
-    dst.clear();
-    if (expected_uncompressed > 0 && expected_uncompressed < 256ULL * 1024ULL * 1024ULL) {
-        dst.reserve(static_cast<size_t>(expected_uncompressed));
-    }
-
-    zs.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(src));
-    zs.avail_in = static_cast<uInt>(src_len);
-
-    uint8_t chunk[65536];
-    int ret = Z_OK;
-    while (ret == Z_OK) {
-        zs.next_out = chunk;
-        zs.avail_out = sizeof(chunk);
-        ret = inflate(&zs, Z_NO_FLUSH);
-        const size_t have = sizeof(chunk) - zs.avail_out;
-        if (have > 0) {
-            dst.insert(dst.end(), chunk, chunk + have);
-        }
-        if (ret == Z_STREAM_END) {
-            break;
-        }
-        if (ret != Z_OK) {
-            inflateEnd(&zs);
-            dst.clear();
-            return false;
-        }
-    }
-
-    inflateEnd(&zs);
-    return ret == Z_STREAM_END;
-}
-
-std::string normalize_zip_path(const std::string& p) {
-    std::string out = p;
-    for (char& c : out) {
-        if (c == '\\') c = '/';
-    }
-    while (!out.empty() && out.front() == '/') out.erase(out.begin());
-    return out;
-}
 
 std::string resolve_relative_zip_path(const std::string& base_dir, const std::string& href) {
     std::string combined = base_dir.empty() ? href : (base_dir + "/" + href);
@@ -148,70 +65,6 @@ std::string resolve_relative_zip_path(const std::string& base_dir, const std::st
         res += parts[i];
     }
     return res;
-}
-
-// 64-bit Win32 custom callback state for libarchive
-struct Win64ArchiveStream {
-    HANDLE handle = INVALID_HANDLE_VALUE;
-    int64_t file_size = 0;
-    std::vector<uint8_t> buffer;
-
-    explicit Win64ArchiveStream(HANDLE h, int64_t sz)
-        : handle(h), file_size(sz), buffer(65536) {}
-};
-
-la_ssize_t la_win64_read_cb(struct archive* /*a*/, void* client_data, const void** buff) {
-    auto* st = static_cast<Win64ArchiveStream*>(client_data);
-    if (!st || st->handle == INVALID_HANDLE_VALUE) return -1;
-
-    DWORD bytes_read = 0;
-    if (!ReadFile(st->handle, st->buffer.data(), static_cast<DWORD>(st->buffer.size()), &bytes_read, nullptr)) {
-        return -1;
-    }
-    *buff = st->buffer.data();
-    return static_cast<la_ssize_t>(bytes_read);
-}
-
-la_int64_t la_win64_skip_cb(struct archive* /*a*/, void* client_data, la_int64_t request) {
-    auto* st = static_cast<Win64ArchiveStream*>(client_data);
-    if (!st || st->handle == INVALID_HANDLE_VALUE) return 0;
-
-    LARGE_INTEGER cur{};
-    LARGE_INTEGER zero{};
-    if (!SetFilePointerEx(st->handle, zero, &cur, FILE_CURRENT)) return 0;
-
-    LARGE_INTEGER target{};
-    target.QuadPart = std::clamp<int64_t>(cur.QuadPart + request, 0, st->file_size);
-    LARGE_INTEGER actual{};
-    if (!SetFilePointerEx(st->handle, target, &actual, FILE_BEGIN)) return 0;
-
-    return static_cast<la_int64_t>(actual.QuadPart - cur.QuadPart);
-}
-
-la_int64_t la_win64_seek_cb(struct archive* /*a*/, void* client_data, la_int64_t offset, int whence) {
-    auto* st = static_cast<Win64ArchiveStream*>(client_data);
-    if (!st || st->handle == INVALID_HANDLE_VALUE) return ARCHIVE_FATAL;
-
-    DWORD move_method = FILE_BEGIN;
-    switch (whence) {
-        case SEEK_SET: move_method = FILE_BEGIN; break;
-        case SEEK_CUR: move_method = FILE_CURRENT; break;
-        case SEEK_END: move_method = FILE_END; break;
-        default: return ARCHIVE_FATAL;
-    }
-
-    LARGE_INTEGER li{};
-    li.QuadPart = offset;
-    LARGE_INTEGER new_pos{};
-    if (!SetFilePointerEx(st->handle, li, &new_pos, move_method)) {
-        return ARCHIVE_FATAL;
-    }
-    return static_cast<la_int64_t>(new_pos.QuadPart);
-}
-
-int la_win64_close_cb(struct archive* /*a*/, void* /*client_data*/) {
-    // Handle lifecycle is owned by ArchiveReader
-    return ARCHIVE_OK;
 }
 
 struct ZipEntryMeta {
@@ -956,396 +809,6 @@ std::unique_ptr<ComicReader> create_comic_reader(
     return create_archive_reader(stream_cache_dir);
 }
 
-namespace {
-
-std::string trim_meta(std::string s) {
-    auto is_ws = [](unsigned char ch) { return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'; };
-    while (!s.empty() && is_ws(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-    while (!s.empty() && is_ws(static_cast<unsigned char>(s.back()))) s.pop_back();
-    return s;
-}
-
-std::string to_lower_ascii_str(std::string s) {
-    for (char& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return s;
-}
-
-bool is_comicinfo_xml_path(const std::string& raw_name) {
-    const std::string norm = normalize_zip_path(raw_name);
-    const size_t slash = norm.find_last_of('/');
-    const std::string base = (slash == std::string::npos) ? norm : norm.substr(slash + 1);
-    return to_lower_ascii_str(base) == "comicinfo.xml";
-}
-
-std::string unescape_xml_entities(const std::string& src) {
-    std::string out;
-    out.reserve(src.size());
-    for (size_t i = 0; i < src.size(); ++i) {
-        if (src[i] == '&') {
-            const size_t semi = src.find(';', i + 1);
-            if (semi != std::string::npos && semi - i <= 10) {
-                const std::string ent = src.substr(i + 1, semi - i - 1);
-                if (ent == "amp")       { out.push_back('&'); i = semi; continue; }
-                if (ent == "lt")        { out.push_back('<'); i = semi; continue; }
-                if (ent == "gt")        { out.push_back('>'); i = semi; continue; }
-                if (ent == "quot")      { out.push_back('"'); i = semi; continue; }
-                if (ent == "apos")      { out.push_back('\''); i = semi; continue; }
-                if (!ent.empty() && ent[0] == '#') {
-                    try {
-                        int code = 0;
-                        if (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')) {
-                            code = std::stoi(ent.substr(2), nullptr, 16);
-                        } else {
-                            code = std::stoi(ent.substr(1), nullptr, 10);
-                        }
-                        if (code > 0 && code < 128) {
-                            out.push_back(static_cast<char>(code));
-                            i = semi;
-                            continue;
-                        }
-                    } catch (...) {}
-                }
-            }
-        }
-        out.push_back(src[i]);
-    }
-    return out;
-}
-
-std::string decode_xml_bytes_to_utf8(const std::vector<uint8_t>& bytes) {
-    if (bytes.empty()) return {};
-    // UTF-16LE BOM
-    if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
-        const size_t wcount = (bytes.size() - 2) / 2;
-        if (wcount == 0) return {};
-        const auto* wptr = reinterpret_cast<const wchar_t*>(bytes.data() + 2);
-        const int needed = WideCharToMultiByte(CP_UTF8, 0, wptr, static_cast<int>(wcount), nullptr, 0, nullptr, nullptr);
-        if (needed <= 0) return {};
-        std::string out(static_cast<size_t>(needed), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wptr, static_cast<int>(wcount), out.data(), needed, nullptr, nullptr);
-        return out;
-    }
-    // UTF-8 BOM
-    size_t offset = 0;
-    if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
-        offset = 3;
-    }
-    return std::string(reinterpret_cast<const char*>(bytes.data() + offset), bytes.size() - offset);
-}
-
-std::string extract_xml_tag_value(const std::string& xml, const std::string& xml_lower, const char* tag_lower) {
-    const std::string open_prefix = std::string("<") + tag_lower;
-    const std::string close_tag = std::string("</") + tag_lower + ">";
-
-    size_t pos = 0;
-    while ((pos = xml_lower.find(open_prefix, pos)) != std::string::npos) {
-        const size_t after_name = pos + open_prefix.size();
-        if (after_name >= xml_lower.size()) break;
-        const char next_ch = xml_lower[after_name];
-        if (next_ch != '>' && next_ch != ' ' && next_ch != '\t' && next_ch != '\r' && next_ch != '\n' && next_ch != '/') {
-            pos = after_name;
-            continue;
-        }
-        const size_t gt = xml_lower.find('>', after_name);
-        if (gt == std::string::npos) break;
-        if (gt > pos && xml_lower[gt - 1] == '/') {
-            pos = gt + 1;
-            continue; // Self-closing empty tag
-        }
-        const size_t end_pos = xml_lower.find(close_tag, gt + 1);
-        if (end_pos == std::string::npos) break;
-        return trim_meta(unescape_xml_entities(xml.substr(gt + 1, end_pos - (gt + 1))));
-    }
-    return {};
-}
-
-std::string merge_tags(const std::string& primary, const std::string& secondary) {
-    if (primary.empty()) return secondary;
-    if (secondary.empty()) return primary;
-
-    std::vector<std::string> tokens;
-    std::unordered_map<std::string, bool> seen;
-    auto push_list = [&](const std::string& csv) {
-        size_t start = 0;
-        while (start <= csv.size()) {
-            const size_t comma = csv.find(',', start);
-            std::string tok = trim_meta(comma == std::string::npos ? csv.substr(start) : csv.substr(start, comma - start));
-            if (!tok.empty()) {
-                const std::string key = to_lower_ascii_str(tok);
-                if (!seen[key]) {
-                    seen[key] = true;
-                    tokens.push_back(std::move(tok));
-                }
-            }
-            if (comma == std::string::npos) break;
-            start = comma + 1;
-        }
-    };
-    push_list(primary);
-    push_list(secondary);
-
-    std::string merged;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (i > 0) merged += ", ";
-        merged += tokens[i];
-    }
-    return merged;
-}
-
-bool parse_comicinfo_xml(const std::vector<uint8_t>& xml_bytes, ComicMetadata& out) {
-    const std::string xml = decode_xml_bytes_to_utf8(xml_bytes);
-    if (xml.empty()) return false;
-    const std::string xml_lower = to_lower_ascii_str(xml);
-
-    out.series   = extract_xml_tag_value(xml, xml_lower, "series");
-    out.author   = extract_xml_tag_value(xml, xml_lower, "writer");
-    const std::string tags  = extract_xml_tag_value(xml, xml_lower, "tags");
-    const std::string genre = extract_xml_tag_value(xml, xml_lower, "genre");
-    out.tags     = merge_tags(tags, genre);
-    out.language = extract_xml_tag_value(xml, xml_lower, "languageiso");
-    return !out.empty();
-}
-
-bool extract_zip64_comicinfo(HANDLE h, int64_t file_size, std::vector<uint8_t>& out_xml) {
-    if (file_size < 22) return false;
-
-    const int64_t tail_len = std::min<int64_t>(file_size, 65557);
-    const int64_t tail_start = file_size - tail_len;
-    std::vector<uint8_t> tail(static_cast<size_t>(tail_len));
-    if (!win64_read_at(h, tail_start, tail.data(), tail.size())) {
-        return false;
-    }
-
-    int64_t eocd_pos_in_tail = -1;
-    for (int64_t i = tail_len - 22; i >= 0; --i) {
-        if (read_le32(tail.data() + i) == 0x06054b50U) {
-            const uint16_t comment_len = read_le16(tail.data() + i + 20);
-            if (i + 22 + comment_len == tail_len) {
-                eocd_pos_in_tail = i;
-                break;
-            }
-        }
-    }
-    if (eocd_pos_in_tail < 0) return false;
-
-    const uint8_t* eocd = tail.data() + eocd_pos_in_tail;
-    uint64_t cd_size = read_le32(eocd + 12);
-    uint64_t cd_offset = read_le32(eocd + 16);
-
-    const int64_t eocd_abs_offset = tail_start + eocd_pos_in_tail;
-    if (eocd_abs_offset >= 20) {
-        uint8_t locator[20];
-        if (win64_read_at(h, eocd_abs_offset - 20, locator, 20) &&
-            read_le32(locator) == 0x07064b50U) {
-            const uint64_t z64_eocd_offset = read_le64(locator + 8);
-            uint8_t z64_eocd[56];
-            if (z64_eocd_offset + 56 <= static_cast<uint64_t>(file_size) &&
-                win64_read_at(h, static_cast<int64_t>(z64_eocd_offset), z64_eocd, 56) &&
-                read_le32(z64_eocd) == 0x06064b50U) {
-                cd_size = read_le64(z64_eocd + 40);
-                cd_offset = read_le64(z64_eocd + 48);
-            }
-        }
-    }
-
-    if (cd_offset + cd_size > static_cast<uint64_t>(file_size) || cd_size == 0 ||
-        cd_size > 64ULL * 1024ULL * 1024ULL) {
-        return false;
-    }
-
-    std::vector<uint8_t> cd_buf(static_cast<size_t>(cd_size));
-    if (!win64_read_at(h, static_cast<int64_t>(cd_offset), cd_buf.data(), cd_buf.size())) {
-        return false;
-    }
-
-    size_t pos = 0;
-    while (pos + 46 <= cd_buf.size()) {
-        const uint8_t* hdr = cd_buf.data() + pos;
-        if (read_le32(hdr) != 0x02014b50U) break;
-
-        const uint16_t method = read_le16(hdr + 10);
-        uint64_t comp_size = read_le32(hdr + 20);
-        uint64_t uncomp_size = read_le32(hdr + 24);
-        const uint16_t name_len = read_le16(hdr + 28);
-        const uint16_t extra_len = read_le16(hdr + 30);
-        const uint16_t comment_len = read_le16(hdr + 32);
-        uint64_t local_off = read_le32(hdr + 42);
-
-        if (pos + 46 + name_len + extra_len + comment_len > cd_buf.size()) break;
-
-        std::string name(reinterpret_cast<const char*>(hdr + 46), name_len);
-        if (is_comicinfo_xml_path(name)) {
-            const uint8_t* extra = hdr + 46 + name_len;
-            if (uncomp_size == 0xFFFFFFFFULL || comp_size == 0xFFFFFFFFULL || local_off == 0xFFFFFFFFULL) {
-                size_t ep = 0;
-                while (ep + 4 <= extra_len) {
-                    const uint16_t tag = read_le16(extra + ep);
-                    const uint16_t sz = read_le16(extra + ep + 2);
-                    ep += 4;
-                    if (ep + sz > extra_len) break;
-                    if (tag == 0x0001U) {
-                        size_t zp = ep;
-                        if (uncomp_size == 0xFFFFFFFFULL && zp + 8 <= ep + sz) { uncomp_size = read_le64(extra + zp); zp += 8; }
-                        if (comp_size == 0xFFFFFFFFULL && zp + 8 <= ep + sz)   { comp_size = read_le64(extra + zp); zp += 8; }
-                        if (local_off == 0xFFFFFFFFULL && zp + 8 <= ep + sz)   { local_off = read_le64(extra + zp); zp += 8; }
-                        break;
-                    }
-                    ep += sz;
-                }
-            }
-
-            constexpr uint64_t kMaxXmlBytes = 2ULL * 1024ULL * 1024ULL;
-            if ((method != 0 && method != 8) || comp_size > kMaxXmlBytes || uncomp_size > kMaxXmlBytes) {
-                return false;
-            }
-
-            uint8_t lfh[30];
-            if (!win64_read_at(h, static_cast<int64_t>(local_off), lfh, 30) || read_le32(lfh) != 0x04034b50U) {
-                return false;
-            }
-            const uint16_t lfh_name_len = read_le16(lfh + 26);
-            const uint16_t lfh_extra_len = read_le16(lfh + 28);
-            const int64_t data_offset = static_cast<int64_t>(local_off) + 30 + lfh_name_len + lfh_extra_len;
-
-            if (method == 0) {
-                out_xml.resize(static_cast<size_t>(comp_size));
-                return win64_read_at(h, data_offset, out_xml.data(), out_xml.size());
-            }
-            std::vector<uint8_t> compressed(static_cast<size_t>(comp_size));
-            if (!win64_read_at(h, data_offset, compressed.data(), compressed.size())) {
-                return false;
-            }
-            return inflate_raw_deflate(compressed.data(), compressed.size(), uncomp_size, out_xml);
-        }
-
-        pos += 46 + name_len + extra_len + comment_len;
-    }
-
-    return false;
-}
-
-bool extract_libarchive_comicinfo(HANDLE h, int64_t file_size, std::vector<uint8_t>& out_xml) {
-    LARGE_INTEGER zero{};
-    if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) {
-        return false;
-    }
-
-    Win64ArchiveStream stream(h, file_size);
-    struct archive* a = archive_read_new();
-    if (!a) return false;
-
-    archive_read_support_format_all(a);
-    archive_read_support_filter_all(a);
-    archive_read_set_read_callback(a, &la_win64_read_cb);
-    archive_read_set_skip_callback(a, &la_win64_skip_cb);
-    archive_read_set_seek_callback(a, &la_win64_seek_cb);
-    archive_read_set_close_callback(a, &la_win64_close_cb);
-    archive_read_set_callback_data(a, &stream);
-
-    bool found = false;
-    if (archive_read_open1(a) == ARCHIVE_OK) {
-        struct archive_entry* entry = nullptr;
-        while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
-            const char* raw_name = archive_entry_pathname(entry);
-            if (raw_name && archive_entry_filetype(entry) != AE_IFDIR && is_comicinfo_xml_path(raw_name)) {
-                const la_int64_t sz = archive_entry_size(entry);
-                if (sz <= 2LL * 1024LL * 1024LL) {
-                    out_xml.clear();
-                    const void* buff = nullptr;
-                    size_t size = 0;
-                    la_int64_t offset = 0;
-                    bool read_ok = true;
-                    while (true) {
-                        const int r = archive_read_data_block(a, &buff, &size, &offset);
-                        if (r == ARCHIVE_EOF) break;
-                        if (r != ARCHIVE_OK) { read_ok = false; break; }
-                        if (size > 0 && buff) {
-                            if (out_xml.size() + size > 2ULL * 1024ULL * 1024ULL) {
-                                read_ok = false;
-                                break;
-                            }
-                            const auto* bytes = static_cast<const uint8_t*>(buff);
-                            out_xml.insert(out_xml.end(), bytes, bytes + size);
-                        }
-                    }
-                    found = read_ok && !out_xml.empty();
-                }
-                break;
-            }
-            archive_read_data_skip(a);
-        }
-    }
-
-    archive_read_free(a);
-    return found;
-}
-
-} // namespace
-
-bool extract_archive_metadata(const std::wstring& path, ComicMetadata& out) {
-    const ComicFormat fmt = detect_comic_format(path);
-    if (fmt != ComicFormat::Cbz && fmt != ComicFormat::Cbr &&
-        fmt != ComicFormat::Cb7 && fmt != ComicFormat::Epub &&
-        fmt != ComicFormat::Cbt) {
-        return false;
-    }
-
-    HANDLE h = CreateFileW(
-        path.c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
-        nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    LARGE_INTEGER size_li{};
-    if (!GetFileSizeEx(h, &size_li) || size_li.QuadPart <= 0) {
-        CloseHandle(h);
-        return false;
-    }
-
-    std::vector<uint8_t> xml_bytes;
-    bool got_xml = false;
-    if (fmt == ComicFormat::Cbz || fmt == ComicFormat::Epub) {
-        got_xml = extract_zip64_comicinfo(h, size_li.QuadPart, xml_bytes);
-    } else {
-        got_xml = extract_libarchive_comicinfo(h, size_li.QuadPart, xml_bytes);
-    }
-
-    CloseHandle(h);
-    if (!got_xml || xml_bytes.empty()) {
-        return false;
-    }
-
-    return parse_comicinfo_xml(xml_bytes, out);
-}
-
-void parse_filename_metadata(const std::string& filename_stem, ComicMetadata& in_out) {
-    if (filename_stem.empty()) return;
-    if (!in_out.author.empty() && !in_out.tags.empty()) return;
-
-    try {
-        static const std::regex kFallbackRe(R"(^\s*\[([^\]]+)\]\s*([^\(\[]+)(?:\(([^\)]+)\))?)");
-        std::smatch m;
-        if (std::regex_search(filename_stem, m, kFallbackRe)) {
-            if (in_out.author.empty() && m.size() > 1 && m[1].matched) {
-                in_out.author = trim_meta(m[1].str());
-            }
-            if (in_out.tags.empty() && m.size() > 3 && m[3].matched) {
-                in_out.tags = trim_meta(m[3].str());
-            }
-        }
-    } catch (...) {
-        // Ignore regex errors on malformed strings
-    }
-}
-
 bool extract_first_image_bytes_fast(const std::wstring& path, std::vector<uint8_t>& out_raw) {
     out_raw.clear();
     const ComicFormat fmt = detect_comic_format(path);
@@ -1366,63 +829,8 @@ bool extract_first_image_bytes_fast(const std::wstring& path, std::vector<uint8_
     }
 
     LARGE_INTEGER size_li{};
-    if (!GetFileSizeEx(h, &size_li) || size_li.QuadPart < 22) {
-        CloseHandle(h);
-        return false;
-    }
-    const int64_t file_size = size_li.QuadPart;
-
-    const int64_t tail_len = std::min<int64_t>(file_size, 65557);
-    const int64_t tail_start = file_size - tail_len;
-    std::vector<uint8_t> tail(static_cast<size_t>(tail_len));
-    if (!win64_read_at(h, tail_start, tail.data(), tail.size())) {
-        CloseHandle(h);
-        return false;
-    }
-
-    int64_t eocd_pos_in_tail = -1;
-    for (int64_t i = tail_len - 22; i >= 0; --i) {
-        if (read_le32(tail.data() + i) == 0x06054b50U) {
-            const uint16_t comment_len = read_le16(tail.data() + i + 20);
-            if (i + 22 + comment_len == tail_len) {
-                eocd_pos_in_tail = i;
-                break;
-            }
-        }
-    }
-    if (eocd_pos_in_tail < 0) {
-        CloseHandle(h);
-        return false;
-    }
-
-    const uint8_t* eocd = tail.data() + eocd_pos_in_tail;
-    uint64_t cd_size = read_le32(eocd + 12);
-    uint64_t cd_offset = read_le32(eocd + 16);
-
-    const int64_t eocd_abs_offset = tail_start + eocd_pos_in_tail;
-    if (eocd_abs_offset >= 20) {
-        uint8_t locator[20];
-        if (win64_read_at(h, eocd_abs_offset - 20, locator, 20) &&
-            read_le32(locator) == 0x07064b50U) {
-            const uint64_t z64_eocd_offset = read_le64(locator + 8);
-            uint8_t z64_eocd[56];
-            if (z64_eocd_offset + 56 <= static_cast<uint64_t>(file_size) &&
-                win64_read_at(h, static_cast<int64_t>(z64_eocd_offset), z64_eocd, 56) &&
-                read_le32(z64_eocd) == 0x06064b50U) {
-                cd_size = read_le64(z64_eocd + 40);
-                cd_offset = read_le64(z64_eocd + 48);
-            }
-        }
-    }
-
-    if (cd_offset + cd_size > static_cast<uint64_t>(file_size) || cd_size == 0 ||
-        cd_size > 64ULL * 1024ULL * 1024ULL) {
-        CloseHandle(h);
-        return false;
-    }
-
-    std::vector<uint8_t> cd_buf(static_cast<size_t>(cd_size));
-    if (!win64_read_at(h, static_cast<int64_t>(cd_offset), cd_buf.data(), cd_buf.size())) {
+    std::vector<uint8_t> cd_buf;
+    if (!GetFileSizeEx(h, &size_li) || !read_zip64_central_directory(h, size_li.QuadPart, cd_buf)) {
         CloseHandle(h);
         return false;
     }
@@ -1444,28 +852,11 @@ bool extract_first_image_bytes_fast(const std::wstring& path, std::vector<uint8_
 
         if (pos + 46 + name_len + extra_len + comment_len > cd_buf.size()) break;
 
-        std::string name(reinterpret_cast<const char*>(hdr + 46), name_len);
+        const std::string name(reinterpret_cast<const char*>(hdr + 46), name_len);
         if (!name.empty() && name.back() != '/' && is_supported_image_filename(name)) {
             std::string norm = normalize_zip_path(name);
             if (!has_best || natural_less(norm, best.name)) {
-                const uint8_t* extra = hdr + 46 + name_len;
-                if (uncomp_size == 0xFFFFFFFFULL || comp_size == 0xFFFFFFFFULL || local_off == 0xFFFFFFFFULL) {
-                    size_t ep = 0;
-                    while (ep + 4 <= extra_len) {
-                        const uint16_t tag = read_le16(extra + ep);
-                        const uint16_t sz = read_le16(extra + ep + 2);
-                        ep += 4;
-                        if (ep + sz > extra_len) break;
-                        if (tag == 0x0001U) {
-                            size_t zp = ep;
-                            if (uncomp_size == 0xFFFFFFFFULL && zp + 8 <= ep + sz) { uncomp_size = read_le64(extra + zp); zp += 8; }
-                            if (comp_size == 0xFFFFFFFFULL && zp + 8 <= ep + sz)   { comp_size = read_le64(extra + zp); zp += 8; }
-                            if (local_off == 0xFFFFFFFFULL && zp + 8 <= ep + sz)   { local_off = read_le64(extra + zp); zp += 8; }
-                            break;
-                        }
-                        ep += sz;
-                    }
-                }
+                parse_zip64_extra_fields(hdr + 46 + name_len, extra_len, uncomp_size, comp_size, local_off);
                 best.name = std::move(norm);
                 best.method = method;
                 best.compressed_size = comp_size;
@@ -1477,33 +868,10 @@ bool extract_first_image_bytes_fast(const std::wstring& path, std::vector<uint8_
         pos += 46 + name_len + extra_len + comment_len;
     }
 
-    if (!has_best || (best.method != 0 && best.method != 8) ||
-        best.compressed_size == 0 || best.compressed_size > 64ULL * 1024ULL * 1024ULL) {
-        CloseHandle(h);
-        return false;
-    }
-
-    uint8_t lfh[30];
-    if (!win64_read_at(h, static_cast<int64_t>(best.local_header_offset), lfh, 30) ||
-        read_le32(lfh) != 0x04034b50U) {
-        CloseHandle(h);
-        return false;
-    }
-    const uint16_t lfh_name_len = read_le16(lfh + 26);
-    const uint16_t lfh_extra_len = read_le16(lfh + 28);
-    const int64_t data_offset = static_cast<int64_t>(best.local_header_offset) + 30 + lfh_name_len + lfh_extra_len;
-
-    bool ok = false;
-    if (best.method == 0) {
-        out_raw.resize(static_cast<size_t>(best.compressed_size));
-        ok = win64_read_at(h, data_offset, out_raw.data(), out_raw.size());
-    } else {
-        std::vector<uint8_t> compressed(static_cast<size_t>(best.compressed_size));
-        if (win64_read_at(h, data_offset, compressed.data(), compressed.size())) {
-            ok = inflate_raw_deflate(compressed.data(), compressed.size(), best.uncompressed_size, out_raw);
-        }
-    }
-
+    constexpr uint64_t kMaxCoverImageBytes = 64ULL * 1024ULL * 1024ULL;
+    const bool ok = has_best && read_zip_entry_bytes(
+        h, best.method, best.local_header_offset,
+        best.compressed_size, best.uncompressed_size, kMaxCoverImageBytes, out_raw);
     CloseHandle(h);
     return ok && !out_raw.empty();
 }

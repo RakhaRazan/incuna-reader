@@ -10,33 +10,9 @@
 #endif
 #include <windows.h>
 
+#include "utils/string_utils.hpp"
+
 namespace koma {
-
-inline std::string wide_to_utf8(const std::wstring& wide) {
-    if (wide.empty()) return {};
-    int size_needed = WideCharToMultiByte(
-        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
-        nullptr, 0, nullptr, nullptr);
-    if (size_needed <= 0) return {};
-    std::string result(static_cast<size_t>(size_needed), '\0');
-    WideCharToMultiByte(
-        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
-        result.data(), size_needed, nullptr, nullptr);
-    return result;
-}
-
-inline std::wstring utf8_to_wide(const std::string& utf8) {
-    if (utf8.empty()) return {};
-    int size_needed = MultiByteToWideChar(
-        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
-        nullptr, 0);
-    if (size_needed <= 0) return {};
-    std::wstring result(static_cast<size_t>(size_needed), L'\0');
-    MultiByteToWideChar(
-        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
-        result.data(), size_needed);
-    return result;
-}
 
 class PortablePaths {
 public:
@@ -61,7 +37,7 @@ public:
     std::filesystem::path webview2_udf_dir() const { return runtime_dir() / L"webview2_udf"; }
 
     // Resolve frontend/dist for both portable distribution (<exe_dir>/runtime/dist or <exe_dir>/frontend/dist)
-    // and development builds (e.g. backend-cpp/build/Release/KomaReader.exe).
+    // and development builds (e.g. backend-cpp/build/Release/IncunaReader.exe).
     std::filesystem::path frontend_dist_dir() const {
         const std::vector<std::filesystem::path> candidates = {
             exe_dir_ / L"runtime" / L"dist",

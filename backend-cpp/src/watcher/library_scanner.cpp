@@ -1,8 +1,8 @@
 #include "watcher/library_scanner.hpp"
 
 #include "covers/cover_manager.hpp"
-#include "formats/comic_reader.hpp"
-#include "portable_paths.hpp"
+#include "formats/metadata_extractor.hpp"
+#include "utils/string_utils.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -10,25 +10,12 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <unordered_set>
 
 namespace koma {
 
 namespace {
-
-std::wstring to_lower_w(std::wstring s) {
-    for (wchar_t& c : s) {
-        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
-    }
-    return s;
-}
-
-std::string to_lower_ascii(std::string s) {
-    for (char& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return s;
-}
 
 bool is_network_path_wide(const std::wstring& p) {
     if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') {
@@ -58,16 +45,7 @@ void populate_comic_metadata(const std::filesystem::path& file_path,
                              const std::string& filename_stem,
                              ComicUpsert& item) {
     ComicMetadata meta;
-    if (format == "pdf") {
-        extract_pdf_metadata(file_path.wstring(), meta);
-    } else if (format == "cbz" || format == "cbr" || format == "cb7" || format == "epub" || format == "cbt") {
-        extract_archive_metadata(file_path.wstring(), meta);
-    }
-
-    if (meta.author.empty() || meta.tags.empty()) {
-        parse_filename_metadata(filename_stem, meta);
-    }
-
+    extract_comic_metadata(file_path, format, filename_stem, meta);
     item.series   = std::move(meta.series);
     item.author   = std::move(meta.author);
     item.tags     = std::move(meta.tags);
@@ -81,14 +59,6 @@ LibraryScanner::LibraryScanner(Database& db,
                                CoverManager* cover_manager,
                                SettingsManager* settings)
     : db_(db), exe_dir_(std::move(exe_dir)), cover_manager_(cover_manager), settings_(settings) {}
-
-void LibraryScanner::set_cover_manager(CoverManager* cover_manager) {
-    cover_manager_ = cover_manager;
-}
-
-void LibraryScanner::set_settings(SettingsManager* settings) {
-    settings_ = settings;
-}
 
 LibraryScanner::~LibraryScanner() {
     cancel_scan_.store(true);
@@ -105,7 +75,7 @@ LibraryScanner::~LibraryScanner() {
 }
 
 bool LibraryScanner::is_indexable_comic_file(const std::filesystem::path& p, std::string& out_format) {
-    const std::wstring ext = to_lower_w(p.extension().wstring());
+    const std::wstring ext = to_lower_wide(p.extension().wstring());
     if (ext == L".cbz" || ext == L".zip") { out_format = "cbz"; return true; }
     if (ext == L".cbr" || ext == L".rar") { out_format = "cbr"; return true; }
     if (ext == L".cb7" || ext == L".7z")  { out_format = "cb7"; return true; }
@@ -218,7 +188,7 @@ bool LibraryScanner::start_folder_import(const std::wstring& folder_path) {
     norm_path = std::filesystem::weakly_canonical(norm_path, ec);
 
     const std::wstring wnorm = norm_path.wstring();
-    const std::wstring lower_key = to_lower_w(wnorm);
+    const std::wstring lower_key = to_lower_wide(wnorm);
     const std::string utf8_folder = wide_to_utf8(wnorm);
     const std::string folder_name = wide_to_utf8(norm_path.filename().wstring());
     const bool is_net = is_network_path_wide(wnorm);
@@ -434,7 +404,7 @@ void LibraryScanner::watch_folder(const std::wstring& folder_path) {
     std::error_code ec;
     if (!std::filesystem::is_directory(folder_path, ec)) return;
 
-    const std::wstring key = to_lower_w(folder_path);
+    const std::wstring key = to_lower_wide(folder_path);
     std::lock_guard<std::mutex> lock(watchers_mutex_);
     if (watchers_.count(key) > 0) return;
 
@@ -449,7 +419,7 @@ void LibraryScanner::watch_folder(const std::wstring& folder_path) {
 }
 
 void LibraryScanner::unwatch_folder(const std::wstring& folder_path) {
-    const std::wstring key = to_lower_w(folder_path);
+    const std::wstring key = to_lower_wide(folder_path);
     std::unique_ptr<WatcherHandle> handle;
     {
         std::lock_guard<std::mutex> lock(watchers_mutex_);

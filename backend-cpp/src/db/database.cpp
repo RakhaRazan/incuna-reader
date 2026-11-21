@@ -1,5 +1,5 @@
 #include "db/database.hpp"
-#include "portable_paths.hpp"
+#include "utils/string_utils.hpp"
 
 #include <sqlite3.h>
 
@@ -14,9 +14,117 @@ namespace koma {
 
 namespace {
 
+constexpr const char* kComicSelectCols =
+    "id, path, relative_path, title, format, file_size_bytes, page_count, "
+    "current_page, status, is_favorite, is_offline_pinned, offline_path, "
+    "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
+    "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '')";
+
+constexpr const char* kComicSelectColsAliased =
+    "c.id, c.path, c.relative_path, c.title, c.format, c.file_size_bytes, c.page_count, "
+    "c.current_page, c.status, c.is_favorite, c.is_offline_pinned, c.offline_path, "
+    "c.cover_pack_offset, c.cover_pack_size, c.added_at, c.last_read_at, c.folder_path, COALESCE(c.is_hidden, 0), "
+    "COALESCE(c.series, ''), COALESCE(c.author, ''), COALESCE(c.tags, ''), COALESCE(c.language, '')";
+
+struct SqlBindVal {
+    bool is_int = false;
+    int64_t i = 0;
+    std::string s;
+};
+
+void bind_sql_params(sqlite3_stmt* stmt, const std::vector<SqlBindVal>& binds) {
+    for (size_t i = 0; i < binds.size(); ++i) {
+        const int idx = static_cast<int>(i + 1);
+        if (binds[i].is_int) {
+            sqlite3_bind_int64(stmt, idx, binds[i].i);
+        } else {
+            sqlite3_bind_text(stmt, idx, binds[i].s.c_str(), -1, SQLITE_TRANSIENT);
+        }
+    }
+}
+
 std::string col_text(sqlite3_stmt* stmt, int idx) {
     const unsigned char* p = sqlite3_column_text(stmt, idx);
     return p ? reinterpret_cast<const char*>(p) : "";
+}
+
+nlohmann::json load_smartview_filter(sqlite3* db, int64_t smartview_id, const std::string& slug) {
+    nlohmann::json sv_filter = nlohmann::json::object();
+    sqlite3_stmt* sv_stmt = nullptr;
+    if (smartview_id > 0) {
+        if (sqlite3_prepare_v2(db, "SELECT query_json FROM smartviews WHERE id = ?1;", -1, &sv_stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(sv_stmt, 1, smartview_id);
+            if (sqlite3_step(sv_stmt) == SQLITE_ROW) {
+                try { sv_filter = nlohmann::json::parse(col_text(sv_stmt, 0)); } catch (...) {}
+            }
+            sqlite3_finalize(sv_stmt);
+        }
+    } else if (!slug.empty()) {
+        if (sqlite3_prepare_v2(db, "SELECT query_json FROM smartviews WHERE slug = ?1;", -1, &sv_stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(sv_stmt, 1, slug.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(sv_stmt) == SQLITE_ROW) {
+                try { sv_filter = nlohmann::json::parse(col_text(sv_stmt, 0)); } catch (...) {}
+            }
+            sqlite3_finalize(sv_stmt);
+        }
+    }
+    return sv_filter;
+}
+
+void append_smartview_filters(const nlohmann::json& sv_filter,
+                              bool include_status,
+                              std::vector<std::string>& conds,
+                              std::vector<SqlBindVal>& binds) {
+    if (!sv_filter.is_object()) return;
+
+    if (include_status && sv_filter.contains("status") && sv_filter["status"].is_string()) {
+        const std::string st = sv_filter["status"].get<std::string>();
+        if (!st.empty() && st != "ALL") {
+            conds.push_back("c.status = ?");
+            binds.push_back({false, 0, st});
+        }
+    }
+    if (sv_filter.contains("is_favorite") && sv_filter["is_favorite"].is_boolean()) {
+        conds.push_back("c.is_favorite = ?");
+        binds.push_back({true, sv_filter["is_favorite"].get<bool>() ? 1 : 0, {}});
+    } else if (sv_filter.contains("only_favorites") && sv_filter["only_favorites"].is_boolean() &&
+               sv_filter["only_favorites"].get<bool>()) {
+        conds.push_back("c.is_favorite = 1");
+    }
+    if (sv_filter.contains("is_offline_pinned") && sv_filter["is_offline_pinned"].is_boolean()) {
+        conds.push_back("c.is_offline_pinned = ?");
+        binds.push_back({true, sv_filter["is_offline_pinned"].get<bool>() ? 1 : 0, {}});
+    } else if (sv_filter.contains("only_offline") && sv_filter["only_offline"].is_boolean() &&
+               sv_filter["only_offline"].get<bool>()) {
+        conds.push_back("c.is_offline_pinned = 1");
+    }
+    if (sv_filter.contains("min_file_size_bytes") && sv_filter["min_file_size_bytes"].is_number_integer()) {
+        conds.push_back("c.file_size_bytes >= ?");
+        binds.push_back({true, sv_filter["min_file_size_bytes"].get<int64_t>(), {}});
+    } else if (sv_filter.contains("min_size_mb") && sv_filter["min_size_mb"].is_number()) {
+        const int64_t mb = sv_filter["min_size_mb"].get<int64_t>();
+        if (mb > 0) {
+            conds.push_back("c.file_size_bytes >= ?");
+            binds.push_back({true, mb * 1024LL * 1024LL, {}});
+        }
+    }
+    if (sv_filter.contains("format") && sv_filter["format"].is_string()) {
+        std::string fmt = to_lower_ascii(sv_filter["format"].get<std::string>());
+        if (!fmt.empty() && fmt != "all") {
+            if (fmt == "7z") fmt = "cb7";
+            conds.push_back("c.format = ?");
+            binds.push_back({false, 0, fmt});
+        }
+    }
+    if (sv_filter.contains("path_contains") && sv_filter["path_contains"].is_string()) {
+        const std::string needle = sv_filter["path_contains"].get<std::string>();
+        if (!needle.empty()) {
+            const std::string pat = "%" + escape_sql_like(needle) + "%";
+            conds.push_back("(c.path LIKE ? ESCAPE '!' OR c.relative_path LIKE ? ESCAPE '!')");
+            binds.push_back({false, 0, pat});
+            binds.push_back({false, 0, pat});
+        }
+    }
 }
 
 ComicRecord read_comic_row(sqlite3_stmt* stmt) {
@@ -303,26 +411,7 @@ bool Database::init_schema() {
         return false;
     }
 
-    // Safely migrate existing databases to add is_hidden (ignoring duplicate-column error)
-    {
-        char* alter_err = nullptr;
-        int alter_rc = sqlite3_exec(
-            db_, "ALTER TABLE comics ADD COLUMN is_hidden INTEGER DEFAULT 0;",
-            nullptr, nullptr, &alter_err);
-        if (alter_rc != SQLITE_OK) {
-            std::string msg = alter_err ? alter_err : "";
-            if (alter_err) sqlite3_free(alter_err);
-            if (msg.find("duplicate column") == std::string::npos) {
-                last_error_ = msg;
-                return false;
-            }
-        }
-    }
-    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_hidden ON comics(is_hidden);")) {
-        return false;
-    }
-
-    // Safely migrate existing databases to add metadata columns (series, author, tags, language)
+    // Safely migrate existing databases to add columns (ignoring duplicate-column errors)
     auto safe_add_column = [&](const char* alter_sql) -> bool {
         char* alter_err = nullptr;
         int alter_rc = sqlite3_exec(db_, alter_sql, nullptr, nullptr, &alter_err);
@@ -336,6 +425,8 @@ bool Database::init_schema() {
         }
         return true;
     };
+    if (!safe_add_column("ALTER TABLE comics ADD COLUMN is_hidden INTEGER DEFAULT 0;")) return false;
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_hidden ON comics(is_hidden);")) return false;
     if (!safe_add_column("ALTER TABLE comics ADD COLUMN series TEXT DEFAULT '';")) return false;
     if (!safe_add_column("ALTER TABLE comics ADD COLUMN author TEXT DEFAULT '';")) return false;
     if (!safe_add_column("ALTER TABLE comics ADD COLUMN tags TEXT DEFAULT '';")) return false;
@@ -593,14 +684,9 @@ bool Database::get_comic(int64_t id, ComicRecord& out) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
-    static constexpr const char* kSql =
-        "SELECT id, path, relative_path, title, format, file_size_bytes, page_count, "
-        "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-        "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-        "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '') "
-        "FROM comics WHERE id = ?1;";
+    const std::string sql = std::string("SELECT ") + kComicSelectCols + " FROM comics WHERE id = ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, kSql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_int64(stmt, 1, id);
     bool found = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -617,16 +703,11 @@ std::vector<ComicRecord> Database::get_adjacent_candidates(int64_t shelf_id, con
     if (!db_) return results;
 
     if (shelf_id > 0) {
-        static constexpr const char* kShelfSql =
-            "SELECT c.id, c.path, c.relative_path, c.title, c.format, c.file_size_bytes, c.page_count, "
-            "c.current_page, c.status, c.is_favorite, c.is_offline_pinned, c.offline_path, "
-            "c.cover_pack_offset, c.cover_pack_size, c.added_at, c.last_read_at, c.folder_path, COALESCE(c.is_hidden, 0), "
-            "COALESCE(c.series, ''), COALESCE(c.author, ''), COALESCE(c.tags, ''), COALESCE(c.language, '') "
-            "FROM comics c "
-            "JOIN comic_shelves cs ON cs.comic_id = c.id "
-            "WHERE cs.shelf_id = ?1;";
+        const std::string shelf_sql =
+            std::string("SELECT ") + kComicSelectColsAliased +
+            " FROM comics c JOIN comic_shelves cs ON cs.comic_id = c.id WHERE cs.shelf_id = ?1;";
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, kShelfSql, -1, &stmt, nullptr) != SQLITE_OK) return results;
+        if (sqlite3_prepare_v2(db_, shelf_sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
         sqlite3_bind_int64(stmt, 1, shelf_id);
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             results.push_back(read_comic_row(stmt));
@@ -637,22 +718,11 @@ std::vector<ComicRecord> Database::get_adjacent_candidates(int64_t shelf_id, con
 
     if (path_prefix.empty()) return results;
 
-    std::string escaped;
-    escaped.reserve(path_prefix.size() + 8);
-    for (char ch : path_prefix) {
-        if (ch == '!' || ch == '%' || ch == '_') escaped.push_back('!');
-        escaped.push_back(ch);
-    }
-    const std::string pat = escaped + "%";
-
-    static constexpr const char* kFolderSql =
-        "SELECT id, path, relative_path, title, format, file_size_bytes, page_count, "
-        "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-        "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-        "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '') "
-        "FROM comics WHERE path LIKE ?1 ESCAPE '!';";
+    const std::string pat = escape_sql_like(path_prefix) + "%";
+    const std::string folder_sql =
+        std::string("SELECT ") + kComicSelectCols + " FROM comics WHERE path LIKE ?1 ESCAPE '!';";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, kFolderSql, -1, &stmt, nullptr) != SQLITE_OK) return results;
+    if (sqlite3_prepare_v2(db_, folder_sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
     sqlite3_bind_text(stmt, 1, pat.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         results.push_back(read_comic_row(stmt));
@@ -665,14 +735,9 @@ bool Database::get_comic_by_path(const std::string& path, ComicRecord& out) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
-    static constexpr const char* kSql =
-        "SELECT id, path, relative_path, title, format, file_size_bytes, page_count, "
-        "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-        "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-        "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '') "
-        "FROM comics WHERE path = ?1;";
+    const std::string sql = std::string("SELECT ") + kComicSelectCols + " FROM comics WHERE path = ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, kSql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
     bool found = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -688,14 +753,11 @@ std::vector<ComicRecord> Database::get_recent_comics(int limit) {
     std::vector<ComicRecord> results;
     if (!db_ || limit <= 0) return results;
 
-    static constexpr const char* kSql =
-        "SELECT id, path, relative_path, title, format, file_size_bytes, page_count, "
-        "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-        "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-        "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '') "
-        "FROM comics WHERE last_read_at > 0 ORDER BY last_read_at DESC, id DESC LIMIT ?1;";
+    const std::string sql =
+        std::string("SELECT ") + kComicSelectCols +
+        " FROM comics WHERE last_read_at > 0 ORDER BY last_read_at DESC, id DESC LIMIT ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, kSql, -1, &stmt, nullptr) != SQLITE_OK) return results;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
     sqlite3_bind_int(stmt, 1, limit);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         results.push_back(read_comic_row(stmt));
@@ -709,17 +771,13 @@ std::vector<ComicRecord> Database::get_continue_reading(int limit, bool include_
     std::vector<ComicRecord> results;
     if (!db_ || limit <= 0) return results;
 
-    static constexpr const char* kSql =
-        "SELECT id, path, relative_path, title, format, file_size_bytes, page_count, "
-        "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-        "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-        "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '') "
-        "FROM comics "
-        "WHERE last_read_at > 0 AND status IN ('reading', 'read') "
+    const std::string sql =
+        std::string("SELECT ") + kComicSelectCols +
+        " FROM comics WHERE last_read_at > 0 AND status IN ('reading', 'read') "
         "AND (?2 = 1 OR COALESCE(is_hidden, 0) = 0) "
         "ORDER BY last_read_at DESC, id DESC LIMIT ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, kSql, -1, &stmt, nullptr) != SQLITE_OK) return results;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
     sqlite3_bind_int(stmt, 1, std::clamp(limit, 1, 100));
     sqlite3_bind_int(stmt, 2, include_hidden ? 1 : 0);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -733,26 +791,7 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
-    nlohmann::json sv_filter = nlohmann::json::object();
-    if (q.smartview_id > 0) {
-        sqlite3_stmt* sv_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT query_json FROM smartviews WHERE id = ?1;", -1, &sv_stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(sv_stmt, 1, q.smartview_id);
-            if (sqlite3_step(sv_stmt) == SQLITE_ROW) {
-                try { sv_filter = nlohmann::json::parse(col_text(sv_stmt, 0)); } catch (...) {}
-            }
-            sqlite3_finalize(sv_stmt);
-        }
-    } else if (!q.smartview.empty()) {
-        sqlite3_stmt* sv_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT query_json FROM smartviews WHERE slug = ?1;", -1, &sv_stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(sv_stmt, 1, q.smartview.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(sv_stmt) == SQLITE_ROW) {
-                try { sv_filter = nlohmann::json::parse(col_text(sv_stmt, 0)); } catch (...) {}
-            }
-            sqlite3_finalize(sv_stmt);
-        }
-    }
+    const nlohmann::json sv_filter = load_smartview_filter(db_, q.smartview_id, q.smartview);
 
     std::ostringstream from_where;
     from_where << " FROM comics c ";
@@ -760,13 +799,8 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
         from_where << " JOIN comic_shelves cs ON cs.comic_id = c.id ";
     }
 
-    struct BindVal {
-        bool is_int = false;
-        int64_t i = 0;
-        std::string s;
-    };
     std::vector<std::string> conds;
-    std::vector<BindVal> binds;
+    std::vector<SqlBindVal> binds;
 
     conds.push_back("c.status = 'unread'");
     if (!q.include_hidden) {
@@ -781,67 +815,10 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
         binds.push_back({false, 0, q.author});
     }
     if (!q.tag.empty()) {
-        std::string escaped;
-        escaped.reserve(q.tag.size());
-        for (char ch : q.tag) {
-            if (ch == '!' || ch == '%' || ch == '_') escaped.push_back('!');
-            escaped.push_back(ch);
-        }
         conds.push_back("c.tags LIKE ? ESCAPE '!'");
-        binds.push_back({false, 0, "%" + escaped + "%"});
+        binds.push_back({false, 0, "%" + escape_sql_like(q.tag) + "%"});
     }
-    if (sv_filter.is_object()) {
-        if (sv_filter.contains("is_favorite") && sv_filter["is_favorite"].is_boolean()) {
-            conds.push_back("c.is_favorite = ?");
-            binds.push_back({true, sv_filter["is_favorite"].get<bool>() ? 1 : 0, {}});
-        } else if (sv_filter.contains("only_favorites") && sv_filter["only_favorites"].is_boolean() &&
-                   sv_filter["only_favorites"].get<bool>()) {
-            conds.push_back("c.is_favorite = 1");
-        }
-        if (sv_filter.contains("is_offline_pinned") && sv_filter["is_offline_pinned"].is_boolean()) {
-            conds.push_back("c.is_offline_pinned = ?");
-            binds.push_back({true, sv_filter["is_offline_pinned"].get<bool>() ? 1 : 0, {}});
-        } else if (sv_filter.contains("only_offline") && sv_filter["only_offline"].is_boolean() &&
-                   sv_filter["only_offline"].get<bool>()) {
-            conds.push_back("c.is_offline_pinned = 1");
-        }
-        if (sv_filter.contains("min_file_size_bytes") && sv_filter["min_file_size_bytes"].is_number_integer()) {
-            conds.push_back("c.file_size_bytes >= ?");
-            binds.push_back({true, sv_filter["min_file_size_bytes"].get<int64_t>(), {}});
-        } else if (sv_filter.contains("min_size_mb") && sv_filter["min_size_mb"].is_number()) {
-            const int64_t mb = sv_filter["min_size_mb"].get<int64_t>();
-            if (mb > 0) {
-                conds.push_back("c.file_size_bytes >= ?");
-                binds.push_back({true, mb * 1024LL * 1024LL, {}});
-            }
-        }
-        if (sv_filter.contains("format") && sv_filter["format"].is_string()) {
-            std::string fmt = sv_filter["format"].get<std::string>();
-            for (char& ch : fmt) {
-                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-            }
-            if (!fmt.empty() && fmt != "all") {
-                if (fmt == "7z") fmt = "cb7";
-                conds.push_back("c.format = ?");
-                binds.push_back({false, 0, fmt});
-            }
-        }
-        if (sv_filter.contains("path_contains") && sv_filter["path_contains"].is_string()) {
-            const std::string needle = sv_filter["path_contains"].get<std::string>();
-            if (!needle.empty()) {
-                std::string escaped;
-                escaped.reserve(needle.size());
-                for (char ch : needle) {
-                    if (ch == '!' || ch == '%' || ch == '_') escaped.push_back('!');
-                    escaped.push_back(ch);
-                }
-                const std::string pat = "%" + escaped + "%";
-                conds.push_back("(c.path LIKE ? ESCAPE '!' OR c.relative_path LIKE ? ESCAPE '!')");
-                binds.push_back({false, 0, pat});
-                binds.push_back({false, 0, pat});
-            }
-        }
-    }
+    append_smartview_filters(sv_filter, /*include_status=*/false, conds, binds);
 
     from_where << " WHERE ";
     for (size_t i = 0; i < conds.size(); ++i) {
@@ -849,21 +826,13 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
         from_where << conds[i];
     }
 
-    auto bind_all = [&](sqlite3_stmt* stmt) {
-        for (size_t i = 0; i < binds.size(); ++i) {
-            const int idx = static_cast<int>(i + 1);
-            if (binds[i].is_int) sqlite3_bind_int64(stmt, idx, binds[i].i);
-            else sqlite3_bind_text(stmt, idx, binds[i].s.c_str(), -1, SQLITE_TRANSIENT);
-        }
-    };
-
     // 1. Fast indexed COUNT(*)
     int64_t total = 0;
     {
         const std::string count_sql = "SELECT COUNT(*)" + from_where.str() + ";";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, count_sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
-        bind_all(stmt);
+        bind_sql_params(stmt, binds);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             total = sqlite3_column_int64(stmt, 0);
         }
@@ -881,7 +850,7 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
         const std::string pick_sql = "SELECT c.id" + from_where.str() + " LIMIT 1 OFFSET ?;";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, pick_sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
-        bind_all(stmt);
+        bind_sql_params(stmt, binds);
         sqlite3_bind_int64(stmt, static_cast<int>(binds.size() + 1), offset);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             picked_id = sqlite3_column_int64(stmt, 0);
@@ -891,14 +860,9 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
     if (picked_id <= 0) return false;
 
     // 3. Primary-key lookup for full ComicRecord
-    static constexpr const char* kRowSql =
-        "SELECT id, path, relative_path, title, format, file_size_bytes, page_count, "
-        "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-        "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-        "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '') "
-        "FROM comics WHERE id = ?1;";
+    const std::string row_sql = std::string("SELECT ") + kComicSelectCols + " FROM comics WHERE id = ?1;";
     sqlite3_stmt* row_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, kRowSql, -1, &row_stmt, nullptr) != SQLITE_OK) return false;
+    if (sqlite3_prepare_v2(db_, row_sql.c_str(), -1, &row_stmt, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_int64(row_stmt, 1, picked_id);
     bool found = false;
     if (sqlite3_step(row_stmt) == SQLITE_ROW) {
@@ -907,28 +871,6 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
     }
     sqlite3_finalize(row_stmt);
     return found;
-}
-
-std::vector<ComicRecord> Database::get_comics_needing_cover_pack() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<ComicRecord> results;
-    if (!db_) return results;
-
-    // Skip comics permanently marked as failed (cover_pack_size = -1).
-    // Order by path ASC so SATA 3 HDDs read folders sequentially without head thrashing.
-    static constexpr const char* kSql =
-        "SELECT id, path, relative_path, title, format, file_size_bytes, page_count, "
-        "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-        "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-        "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '') "
-        "FROM comics WHERE cover_pack_size != -1 AND (cover_pack_offset < 0 OR cover_pack_size <= 0) ORDER BY path ASC;";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, kSql, -1, &stmt, nullptr) != SQLITE_OK) return results;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(read_comic_row(stmt));
-    }
-    sqlite3_finalize(stmt);
-    return results;
 }
 
 std::vector<UnindexedCoverRow> Database::get_unindexed_covers_chunk(int limit, const std::string& after_path) {
@@ -980,30 +922,7 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
     if (!db_) return res;
 
     // Resolve optional smartview JSON filter (by smartview_id or slug)
-    nlohmann::json sv_filter = nlohmann::json::object();
-    if (q.smartview_id > 0) {
-        sqlite3_stmt* sv_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT query_json FROM smartviews WHERE id = ?1;", -1, &sv_stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(sv_stmt, 1, q.smartview_id);
-            if (sqlite3_step(sv_stmt) == SQLITE_ROW) {
-                try {
-                    sv_filter = nlohmann::json::parse(col_text(sv_stmt, 0));
-                } catch (...) {}
-            }
-            sqlite3_finalize(sv_stmt);
-        }
-    } else if (!q.smartview.empty()) {
-        sqlite3_stmt* sv_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT query_json FROM smartviews WHERE slug = ?1;", -1, &sv_stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(sv_stmt, 1, q.smartview.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(sv_stmt) == SQLITE_ROW) {
-                try {
-                    sv_filter = nlohmann::json::parse(col_text(sv_stmt, 0));
-                } catch (...) {}
-            }
-            sqlite3_finalize(sv_stmt);
-        }
-    }
+    const nlohmann::json sv_filter = load_smartview_filter(db_, q.smartview_id, q.smartview);
 
     std::string fts_expr = build_safe_fts5_query(q.search);
 
@@ -1017,12 +936,7 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
     }
 
     std::vector<std::string> conds;
-    struct BindVal {
-        bool is_int = false;
-        int64_t i = 0;
-        std::string s;
-    };
-    std::vector<BindVal> binds;
+    std::vector<SqlBindVal> binds;
 
     if (!q.include_hidden) {
         conds.push_back("COALESCE(c.is_hidden, 0) = 0");
@@ -1063,17 +977,8 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
                     binds.push_back({false, 0, bnorm});
                 }
             } else {
-                auto escape_like = [](const std::string& s) {
-                    std::string out;
-                    out.reserve(s.size());
-                    for (char ch : s) {
-                        if (ch == '!' || ch == '%' || ch == '_') out.push_back('!');
-                        out.push_back(ch);
-                    }
-                    return out;
-                };
-                const std::string pat_s = escape_like(norm) + "/%";
-                const std::string pat_b = escape_like(bnorm) + "\\%";
+                const std::string pat_s = escape_sql_like(norm) + "/%";
+                const std::string pat_b = escape_sql_like(bnorm) + "\\%";
                 conds.push_back(
                     "(c.relative_path LIKE ? ESCAPE '!' OR c.relative_path LIKE ? ESCAPE '!' "
                     "OR c.folder_path = ? OR c.path LIKE ? ESCAPE '!' OR c.path LIKE ? ESCAPE '!')");
@@ -1094,74 +999,10 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
         binds.push_back({false, 0, q.author});
     }
     if (!q.tag.empty()) {
-        std::string escaped;
-        escaped.reserve(q.tag.size());
-        for (char ch : q.tag) {
-            if (ch == '!' || ch == '%' || ch == '_') escaped.push_back('!');
-            escaped.push_back(ch);
-        }
         conds.push_back("c.tags LIKE ? ESCAPE '!'");
-        binds.push_back({false, 0, "%" + escaped + "%"});
+        binds.push_back({false, 0, "%" + escape_sql_like(q.tag) + "%"});
     }
-    if (sv_filter.is_object()) {
-        if (sv_filter.contains("status") && sv_filter["status"].is_string()) {
-            const std::string st = sv_filter["status"].get<std::string>();
-            if (!st.empty() && st != "ALL") {
-                conds.push_back("c.status = ?");
-                binds.push_back({false, 0, st});
-            }
-        }
-        if (sv_filter.contains("is_favorite") && sv_filter["is_favorite"].is_boolean()) {
-            conds.push_back("c.is_favorite = ?");
-            binds.push_back({true, sv_filter["is_favorite"].get<bool>() ? 1 : 0, {}});
-        } else if (sv_filter.contains("only_favorites") && sv_filter["only_favorites"].is_boolean() &&
-                   sv_filter["only_favorites"].get<bool>()) {
-            conds.push_back("c.is_favorite = 1");
-        }
-        if (sv_filter.contains("is_offline_pinned") && sv_filter["is_offline_pinned"].is_boolean()) {
-            conds.push_back("c.is_offline_pinned = ?");
-            binds.push_back({true, sv_filter["is_offline_pinned"].get<bool>() ? 1 : 0, {}});
-        } else if (sv_filter.contains("only_offline") && sv_filter["only_offline"].is_boolean() &&
-                   sv_filter["only_offline"].get<bool>()) {
-            conds.push_back("c.is_offline_pinned = 1");
-        }
-        if (sv_filter.contains("min_file_size_bytes") && sv_filter["min_file_size_bytes"].is_number_integer()) {
-            conds.push_back("c.file_size_bytes >= ?");
-            binds.push_back({true, sv_filter["min_file_size_bytes"].get<int64_t>(), {}});
-        } else if (sv_filter.contains("min_size_mb") && sv_filter["min_size_mb"].is_number()) {
-            const int64_t mb = sv_filter["min_size_mb"].get<int64_t>();
-            if (mb > 0) {
-                conds.push_back("c.file_size_bytes >= ?");
-                binds.push_back({true, mb * 1024LL * 1024LL, {}});
-            }
-        }
-        if (sv_filter.contains("format") && sv_filter["format"].is_string()) {
-            std::string fmt = sv_filter["format"].get<std::string>();
-            for (char& ch : fmt) {
-                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-            }
-            if (!fmt.empty() && fmt != "all") {
-                if (fmt == "7z") fmt = "cb7";
-                conds.push_back("c.format = ?");
-                binds.push_back({false, 0, fmt});
-            }
-        }
-        if (sv_filter.contains("path_contains") && sv_filter["path_contains"].is_string()) {
-            const std::string needle = sv_filter["path_contains"].get<std::string>();
-            if (!needle.empty()) {
-                std::string escaped;
-                escaped.reserve(needle.size());
-                for (char ch : needle) {
-                    if (ch == '!' || ch == '%' || ch == '_') escaped.push_back('!');
-                    escaped.push_back(ch);
-                }
-                const std::string pat = "%" + escaped + "%";
-                conds.push_back("(c.path LIKE ? ESCAPE '!' OR c.relative_path LIKE ? ESCAPE '!')");
-                binds.push_back({false, 0, pat});
-                binds.push_back({false, 0, pat});
-            }
-        }
-    }
+    append_smartview_filters(sv_filter, /*include_status=*/true, conds, binds);
 
     if (!conds.empty()) {
         from_where << " WHERE ";
@@ -1171,14 +1012,6 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
         }
     }
 
-    auto bind_all = [&](sqlite3_stmt* stmt) {
-        for (size_t i = 0; i < binds.size(); ++i) {
-            const int idx = static_cast<int>(i + 1);
-            if (binds[i].is_int) sqlite3_bind_int64(stmt, idx, binds[i].i);
-            else sqlite3_bind_text(stmt, idx, binds[i].s.c_str(), -1, SQLITE_TRANSIENT);
-        }
-    };
-
     const int safe_limit = std::clamp(q.limit > 0 ? q.limit : 120, 1, 500);
     const int safe_offset = std::max(0, q.offset);
 
@@ -1187,7 +1020,7 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
         const std::string count_sql = "SELECT COUNT(*)" + from_where.str() + ";";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, count_sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
-            bind_all(stmt);
+            bind_sql_params(stmt, binds);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
                 res.total_count = sqlite3_column_int64(stmt, 0);
             }
@@ -1200,21 +1033,18 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
 
     // 2. Paginated/windowed slice
     std::string order_by = " ORDER BY c.title COLLATE NOCASE ASC, c.id ASC ";
-    if (q.sort == "title_desc")      order_by = " ORDER BY c.title COLLATE NOCASE DESC, c.id DESC ";
-    else if (q.sort == "added_desc") order_by = " ORDER BY c.added_at DESC, c.id DESC ";
+    if (q.sort == "title_desc")          order_by = " ORDER BY c.title COLLATE NOCASE DESC, c.id DESC ";
+    else if (q.sort == "added_desc")     order_by = " ORDER BY c.added_at DESC, c.id DESC ";
     else if (q.sort == "last_read_desc") order_by = " ORDER BY c.last_read_at DESC, c.id DESC ";
-    else if (q.sort == "size_desc")  order_by = " ORDER BY c.file_size_bytes DESC, c.id ASC ";
+    else if (q.sort == "size_desc")      order_by = " ORDER BY c.file_size_bytes DESC, c.id ASC ";
 
     const std::string select_sql =
-        "SELECT c.id, c.path, c.relative_path, c.title, c.format, c.file_size_bytes, c.page_count, "
-        "c.current_page, c.status, c.is_favorite, c.is_offline_pinned, c.offline_path, "
-        "c.cover_pack_offset, c.cover_pack_size, c.added_at, c.last_read_at, c.folder_path, COALESCE(c.is_hidden, 0), "
-        "COALESCE(c.series, ''), COALESCE(c.author, ''), COALESCE(c.tags, ''), COALESCE(c.language, '') " +
+        std::string("SELECT ") + kComicSelectColsAliased + " " +
         from_where.str() + order_by + " LIMIT ? OFFSET ?;";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, select_sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
-        bind_all(stmt);
+        bind_sql_params(stmt, binds);
         const int base = static_cast<int>(binds.size());
         sqlite3_bind_int(stmt, base + 1, safe_limit);
         sqlite3_bind_int(stmt, base + 2, safe_offset);
@@ -1260,25 +1090,6 @@ bool Database::update_comic_progress(int64_t id,
 
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(db_) > 0);
     if (!ok) last_error_ = sqlite3_errmsg(db_);
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-bool Database::update_comic_cover_pack(int64_t id, int64_t offset, int64_t size) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return false;
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "UPDATE comics SET cover_pack_offset = ?1, cover_pack_size = ?2 WHERE id = ?3;",
-            -1, &stmt, nullptr) != SQLITE_OK) {
-        return false;
-    }
-    sqlite3_bind_int64(stmt, 1, offset);
-    sqlite3_bind_int64(stmt, 2, size);
-    sqlite3_bind_int64(stmt, 3, id);
-    const bool ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(db_) > 0);
     sqlite3_finalize(stmt);
     return ok;
 }
@@ -1387,16 +1198,6 @@ std::vector<std::pair<int64_t, std::string>> Database::get_unpinned_comics_under
     std::vector<std::pair<int64_t, std::string>> results;
     if (!db_ || folder_prefix.empty()) return results;
 
-    auto escape_like = [](const std::string& s) {
-        std::string res;
-        res.reserve(s.size());
-        for (char ch : s) {
-            if (ch == '!' || ch == '%' || ch == '_') res.push_back('!');
-            res.push_back(ch);
-        }
-        return res;
-    };
-
     std::string clean_prefix = folder_prefix;
     while (clean_prefix.size() > 1 && (clean_prefix.back() == '\\' || clean_prefix.back() == '/')) {
         if (clean_prefix.size() == 3 && clean_prefix[1] == ':') break; // Keep drive root like "C:\"
@@ -1404,7 +1205,7 @@ std::vector<std::pair<int64_t, std::string>> Database::get_unpinned_comics_under
     }
 
     const bool ends_with_sep = (!clean_prefix.empty() && (clean_prefix.back() == '\\' || clean_prefix.back() == '/'));
-    const std::string escaped = escape_like(clean_prefix);
+    const std::string escaped = escape_sql_like(clean_prefix);
     const std::string pat_bslash = ends_with_sep ? (escaped + "%") : (escaped + "\\%");
     const std::string pat_slash  = ends_with_sep ? (escaped + "%") : (escaped + "/%");
 
@@ -1727,32 +1528,6 @@ std::vector<SmartViewRecord> Database::get_smartviews() {
     return results;
 }
 
-bool Database::get_smartview_by_slug(const std::string& slug, SmartViewRecord& out) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return false;
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT id, slug, name, query_json, is_builtin, sort_order FROM smartviews WHERE slug = ?1;",
-            -1, &stmt, nullptr) != SQLITE_OK) {
-        return false;
-    }
-    sqlite3_bind_text(stmt, 1, slug.c_str(), -1, SQLITE_TRANSIENT);
-    bool found = false;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        out.id = sqlite3_column_int64(stmt, 0);
-        out.slug = col_text(stmt, 1);
-        out.name = col_text(stmt, 2);
-        out.query_json = col_text(stmt, 3);
-        out.is_builtin = sqlite3_column_int(stmt, 4) != 0;
-        out.sort_order = sqlite3_column_int(stmt, 5);
-        found = true;
-    }
-    sqlite3_finalize(stmt);
-    return found;
-}
-
 bool Database::create_smartview(const std::string& slug,
                                 const std::string& name,
                                 const std::string& query_json,
@@ -1980,12 +1755,6 @@ std::vector<LibraryFolderEntry> Database::get_library_folders(const std::string&
             while (!s.empty() && s.front() == '/') s.erase(s.begin());
         }
         while (s.size() > 1 && s.back() == '/') s.pop_back();
-        return s;
-    };
-    auto to_lower_ascii = [](std::string s) {
-        for (char& c : s) {
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-        }
         return s;
     };
     auto leaf_name = [](const std::string& norm_path) -> std::string {

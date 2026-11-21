@@ -1,5 +1,6 @@
 #include "formats/comic_reader.hpp"
 #include "formats/image_utils.hpp"
+#include "formats/pdfium_runtime.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -21,14 +22,132 @@
 
 namespace koma {
 
-namespace {
+namespace detail {
 
-// Dedicated global mutex guarding ALL PDFium C API calls.
-// PDFium is not thread-safe across concurrent worker threads even on separate documents.
 std::mutex& pdfium_global_mutex() {
     static std::mutex m;
     return m;
 }
+
+namespace {
+int& pdfium_ref_count() {
+    static int count = 0;
+    return count;
+}
+} // namespace
+
+void PdfiumRuntime::acquire() {
+    std::lock_guard<std::mutex> lock(pdfium_global_mutex());
+    if (pdfium_ref_count() == 0) {
+        FPDF_LIBRARY_CONFIG config{};
+        config.version = 2;
+        config.m_pUserFontPaths = nullptr;
+        config.m_pIsolate = nullptr;
+        config.m_v8EmbedderSlot = 0;
+        FPDF_InitLibraryWithConfig(&config);
+    }
+    ++pdfium_ref_count();
+}
+
+void PdfiumRuntime::release() {
+    std::lock_guard<std::mutex> lock(pdfium_global_mutex());
+    if (pdfium_ref_count() > 0) {
+        --pdfium_ref_count();
+        if (pdfium_ref_count() == 0) {
+            FPDF_DestroyLibrary();
+        }
+    }
+}
+
+int win64_pdf_get_block(void* param,
+                        unsigned long position,
+                        unsigned char* pBuf,
+                        unsigned long size) {
+    if (!param || (!pBuf && size > 0)) return 0;
+    auto* stream = static_cast<Win64PdfStream*>(param);
+    if (stream->handle == INVALID_HANDLE_VALUE) return 0;
+    if (size == 0) return 1;
+
+    std::lock_guard<std::mutex> lock(stream->io_mutex);
+
+    const int64_t offset64 = static_cast<int64_t>(position);
+    if (offset64 < 0 || offset64 + static_cast<int64_t>(size) > stream->file_size) {
+        return 0;
+    }
+
+    // 1. Fast path: serve directly from 64 KB read-ahead buffer (0 syscalls)
+    if (stream->buf_start >= 0 &&
+        offset64 >= stream->buf_start &&
+        offset64 + static_cast<int64_t>(size) <= stream->buf_start + static_cast<int64_t>(stream->buf_valid)) {
+        const size_t rel = static_cast<size_t>(offset64 - stream->buf_start);
+        std::memcpy(pBuf, stream->read_buf.data() + rel, size);
+        return 1;
+    }
+
+    // 2. Buffered read-ahead for small/medium reads (<= 64 KB)
+    if (size <= Win64PdfStream::kReadAheadBytes) {
+        if (stream->read_buf.size() < Win64PdfStream::kReadAheadBytes) {
+            stream->read_buf.resize(Win64PdfStream::kReadAheadBytes);
+        }
+
+        LARGE_INTEGER li{};
+        li.QuadPart = offset64;
+        if (!SetFilePointerEx(stream->handle, li, nullptr, FILE_BEGIN)) {
+            return 0;
+        }
+
+        const size_t want = static_cast<size_t>(
+            std::min<int64_t>(static_cast<int64_t>(Win64PdfStream::kReadAheadBytes),
+                              stream->file_size - offset64));
+        size_t total_got = 0;
+        while (total_got < size) {
+            DWORD chunk = 0;
+            const DWORD to_read = static_cast<DWORD>(want - total_got);
+            if (!ReadFile(stream->handle, stream->read_buf.data() + total_got, to_read, &chunk, nullptr) ||
+                chunk == 0) {
+                stream->buf_start = -1;
+                stream->buf_valid = 0;
+                return 0;
+            }
+            total_got += chunk;
+        }
+
+        stream->buf_start = offset64;
+        stream->buf_valid = total_got;
+        std::memcpy(pBuf, stream->read_buf.data(), size);
+        return 1;
+    }
+
+    // 3. Large contiguous read (> 64 KB): read directly into caller buffer
+    LARGE_INTEGER li{};
+    li.QuadPart = offset64;
+    if (!SetFilePointerEx(stream->handle, li, nullptr, FILE_BEGIN)) {
+        return 0;
+    }
+
+    unsigned long total_read = 0;
+    while (total_read < size) {
+        DWORD chunk = 0;
+        const DWORD to_read = static_cast<DWORD>(size - total_read);
+        if (!ReadFile(stream->handle, pBuf + total_read, to_read, &chunk, nullptr)) {
+            return 0;
+        }
+        if (chunk == 0) {
+            return 0; // Unexpected EOF
+        }
+        total_read += chunk;
+    }
+    return 1;
+}
+
+} // namespace detail
+
+namespace {
+
+using detail::PdfiumRuntime;
+using detail::Win64PdfStream;
+using detail::pdfium_global_mutex;
+using detail::win64_pdf_get_block;
 
 template <typename Fn>
 class ScopeExit {
@@ -113,133 +232,6 @@ public:
 private:
     FPDF_BITMAP bmp_ = nullptr;
 };
-
-// Thread-safe reference-counted PDFium library lifecycle manager
-class PdfiumRuntime {
-public:
-    static void acquire() {
-        std::lock_guard<std::mutex> lock(pdfium_global_mutex());
-        if (ref_count() == 0) {
-            FPDF_LIBRARY_CONFIG config{};
-            config.version = 2;
-            config.m_pUserFontPaths = nullptr;
-            config.m_pIsolate = nullptr;
-            config.m_v8EmbedderSlot = 0;
-            FPDF_InitLibraryWithConfig(&config);
-        }
-        ++ref_count();
-    }
-
-    static void release() {
-        std::lock_guard<std::mutex> lock(pdfium_global_mutex());
-        if (ref_count() > 0) {
-            --ref_count();
-            if (ref_count() == 0) {
-                FPDF_DestroyLibrary();
-            }
-        }
-    }
-
-private:
-    static int& ref_count() {
-        static int count = 0;
-        return count;
-    }
-};
-
-// 64-bit Win32 custom read stream context for PDFium FPDF_FILEACCESS
-// Includes a 64 KB sequential read-ahead buffer to avoid thousands of tiny disk syscalls on SATA 3 HDDs.
-struct Win64PdfStream {
-    static constexpr size_t kReadAheadBytes = 64 * 1024;
-    HANDLE handle = INVALID_HANDLE_VALUE;
-    int64_t file_size = 0;
-    std::mutex io_mutex;
-    std::vector<uint8_t> read_buf;
-    int64_t buf_start = -1;
-    size_t buf_valid = 0;
-};
-
-// FPDF_CUSTOM_READ callback backed by Win32 64-bit SetFilePointerEx + 64 KB buffered ReadFile
-int win64_pdf_get_block(void* param,
-                        unsigned long position,
-                        unsigned char* pBuf,
-                        unsigned long size) {
-    if (!param || (!pBuf && size > 0)) return 0;
-    auto* stream = static_cast<Win64PdfStream*>(param);
-    if (stream->handle == INVALID_HANDLE_VALUE) return 0;
-    if (size == 0) return 1;
-
-    std::lock_guard<std::mutex> lock(stream->io_mutex);
-
-    const int64_t offset64 = static_cast<int64_t>(position);
-    if (offset64 < 0 || offset64 + static_cast<int64_t>(size) > stream->file_size) {
-        return 0;
-    }
-
-    // 1. Fast path: serve directly from 64 KB read-ahead buffer (0 syscalls)
-    if (stream->buf_start >= 0 &&
-        offset64 >= stream->buf_start &&
-        offset64 + static_cast<int64_t>(size) <= stream->buf_start + static_cast<int64_t>(stream->buf_valid)) {
-        const size_t rel = static_cast<size_t>(offset64 - stream->buf_start);
-        std::memcpy(pBuf, stream->read_buf.data() + rel, size);
-        return 1;
-    }
-
-    // 2. Buffered read-ahead for small/medium reads (<= 64 KB)
-    if (size <= Win64PdfStream::kReadAheadBytes) {
-        if (stream->read_buf.size() < Win64PdfStream::kReadAheadBytes) {
-            stream->read_buf.resize(Win64PdfStream::kReadAheadBytes);
-        }
-
-        LARGE_INTEGER li{};
-        li.QuadPart = offset64;
-        if (!SetFilePointerEx(stream->handle, li, nullptr, FILE_BEGIN)) {
-            return 0;
-        }
-
-        const size_t want = static_cast<size_t>(
-            std::min<int64_t>(static_cast<int64_t>(Win64PdfStream::kReadAheadBytes),
-                              stream->file_size - offset64));
-        size_t total_got = 0;
-        while (total_got < size) {
-            DWORD chunk = 0;
-            const DWORD to_read = static_cast<DWORD>(want - total_got);
-            if (!ReadFile(stream->handle, stream->read_buf.data() + total_got, to_read, &chunk, nullptr) ||
-                chunk == 0) {
-                stream->buf_start = -1;
-                stream->buf_valid = 0;
-                return 0;
-            }
-            total_got += chunk;
-        }
-
-        stream->buf_start = offset64;
-        stream->buf_valid = total_got;
-        std::memcpy(pBuf, stream->read_buf.data(), size);
-        return 1;
-    }
-
-    // 3. Large contiguous read (> 64 KB): read directly into caller buffer
-    LARGE_INTEGER li{};
-    li.QuadPart = offset64;
-    if (!SetFilePointerEx(stream->handle, li, nullptr, FILE_BEGIN)) {
-        return 0;
-    }
-
-    unsigned long total_read = 0;
-    while (total_read < size) {
-        DWORD chunk = 0;
-        const DWORD to_read = static_cast<DWORD>(size - total_read);
-        if (!ReadFile(stream->handle, pBuf + total_read, to_read, &chunk, nullptr)) {
-            return 0;
-        }
-        if (chunk == 0) {
-            return 0; // Unexpected EOF
-        }
-        total_read += chunk;
-    }
-    return 1;
-}
 
 std::string fpdf_error_string(unsigned long err) {
     switch (err) {
@@ -709,94 +701,6 @@ private:
 
 std::unique_ptr<ComicReader> create_pdf_reader() {
     return std::make_unique<PdfReader>();
-}
-
-namespace {
-
-std::string trim_ascii(std::string s) {
-    auto is_ws = [](unsigned char ch) { return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'; };
-    while (!s.empty() && is_ws(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-    while (!s.empty() && is_ws(static_cast<unsigned char>(s.back()))) s.pop_back();
-    return s;
-}
-
-std::string read_pdf_meta_tag_locked(FPDF_DOCUMENT doc, const char* tag) {
-    if (!doc || !tag) return {};
-    const unsigned long bytes = FPDF_GetMetaText(doc, tag, nullptr, 0);
-    if (bytes <= 2) return {};
-
-    std::vector<wchar_t> wbuf((bytes + 1) / 2 + 1, L'\0');
-    const unsigned long written = FPDF_GetMetaText(doc, tag, wbuf.data(), bytes);
-    if (written <= 2) return {};
-
-    const int wlen = static_cast<int>(wcsnlen(wbuf.data(), wbuf.size()));
-    if (wlen <= 0) return {};
-
-    const int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), wlen, nullptr, 0, nullptr, nullptr);
-    if (utf8_len <= 0) return {};
-
-    std::string out(static_cast<size_t>(utf8_len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), wlen, out.data(), utf8_len, nullptr, nullptr);
-    return trim_ascii(std::move(out));
-}
-
-} // namespace
-
-bool extract_pdf_metadata(const std::wstring& path, ComicMetadata& out) {
-    HANDLE h = CreateFileW(
-        path.c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
-        nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    ScopeExit handle_guard([&h]() {
-        if (h != INVALID_HANDLE_VALUE) {
-            CloseHandle(h);
-            h = INVALID_HANDLE_VALUE;
-        }
-    });
-
-    LARGE_INTEGER size_li{};
-    if (!GetFileSizeEx(h, &size_li) || size_li.QuadPart <= 0) {
-        return false;
-    }
-
-    PdfiumRuntime::acquire();
-    ScopeExit runtime_guard([]() { PdfiumRuntime::release(); });
-
-    Win64PdfStream stream;
-    stream.handle = h;
-    stream.file_size = size_li.QuadPart;
-
-    FPDF_FILEACCESS access{};
-    access.m_FileLen = (size_li.QuadPart > static_cast<int64_t>(std::numeric_limits<unsigned long>::max()))
-        ? std::numeric_limits<unsigned long>::max()
-        : static_cast<unsigned long>(size_li.QuadPart);
-    access.m_GetBlock = &win64_pdf_get_block;
-    access.m_Param = &stream;
-
-    std::lock_guard<std::mutex> pdf_lock(pdfium_global_mutex());
-    FPDF_DOCUMENT doc = FPDF_LoadCustomDocument(&access, nullptr);
-    if (!doc) {
-        return false;
-    }
-    ScopeExit doc_guard([&doc]() {
-        if (doc) {
-            FPDF_CloseDocument(doc);
-            doc = nullptr;
-        }
-    });
-
-    out.author = read_pdf_meta_tag_locked(doc, "Author");
-    out.series = read_pdf_meta_tag_locked(doc, "Subject");
-    out.tags   = read_pdf_meta_tag_locked(doc, "Keywords");
-    return !out.empty();
 }
 
 } // namespace koma

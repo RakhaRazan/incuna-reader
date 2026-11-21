@@ -12,6 +12,7 @@ node_modules/
 frontend/node_modules/
 
 # Portable runtime & user data
+IncunaReader.exe
 KomaReader.exe
 data/
 runtime/
@@ -25,3 +26,8 @@ runtime/
 *.db-wal
 *.db-shm
 *.pack
+
+# Comic & PDF files
+*.cbz
+*.cbr
+*.pdf
