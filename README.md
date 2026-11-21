@@ -66,10 +66,10 @@ IncunaReader/
 
 Incuna Reader includes a configurable 2-mode cover thumbnail engine (`backend-cpp/src/covers/cover_manager.cpp`) designed to avoid SATA HDD thrashing while keeping library scrolling instant:
 
-1. **Mode 1 — Persistent Cover Pack (`persistent_pack`, default):**
+1. **Mode 1 - Persistent Cover Pack (`persistent_pack`, default):**
    - Stores resized cover thumbnails (`200x280` max) in a single concatenated `data/covers.pack` file indexed by `(cover_pack_offset, cover_pack_size)` in SQLite for **O(1)** disk reads.
    - Builds missing covers in the background using a sequential disk reader + parallel CPU decode workers, while visible viewport cards cut to the front of the priority queue.
-2. **Mode 2 — RAM-Only / Zero Disk (`ram_only`):**
+2. **Mode 2 - RAM-Only / Zero Disk (`ram_only`):**
    - Uses **0 MB** of persistent cover disk storage (`covers.pack` can be purged cleanly from Settings).
    - Serves covers from a **64 MB bounded RAM LRU cache**, falling back to Windows Shell thumbnail cache (`IShellItemImageFactory` with `SIIGBF_INCACHEONLY`) and a **2-thread** extraction pool with automatic scroll cancellation for off-screen items.
 
