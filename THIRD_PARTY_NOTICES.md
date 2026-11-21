@@ -8,7 +8,7 @@ Incuna Reader is built on top of the following open-source libraries, engines, t
   Used for on-demand PDF page rendering and metadata extraction (`FPDF_GetMetaText`) via `pdfium.dll`.
 - **libarchive** (Tim Kientzle & libarchive contributors) - BSD-2-Clause License  
   Used for streaming comic archives (`.cbr`/RAR5, `.cb7`/7z, `.cbt`/TAR, and archive fallbacks), paired with **zlib** (Jean-loup Gailly & Mark Adler, zlib License) and **XZ / liblzma** (Tukaani Project, 0BSD / Public Domain).
-- **SQLite** (D. Richard Hipp & SQLite contributors) — Public Domain  
+- **SQLite** (D. Richard Hipp & SQLite contributors) - Public Domain  
   Used for the local library database (`library.db`) with WAL journaling and FTS5 full-text search.
 - **stb** (`stb_image`, `stb_image_write` by Sean Barrett) - MIT / Public Domain  
   Used for image decoding and JPEG encoding, alongside **libwebp** (Google, BSD-3-Clause License) for WebP decoding and encoding.
