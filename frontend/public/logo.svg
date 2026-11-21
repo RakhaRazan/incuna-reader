@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Outer Obsidian Frame -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#0B0D10" stroke="#1E293B" stroke-width="1.75"/>
+
+  <!-- Left Angled Open-Codex Folio Wing -->
+  <polygon
+    points="11,20 24,25 24,49.5 11,44.5"
+    fill="#22D3EE"
+    fill-opacity="0.16"
+    stroke="#22D3EE"
+    stroke-width="2.8"
+    stroke-linejoin="round"
+  />
+  <line x1="15" y1="28.5" x2="20.5" y2="30.6" stroke="#22D3EE" stroke-opacity="0.6" stroke-width="1.6" stroke-linecap="round"/>
+  <line x1="15" y1="34.5" x2="20.5" y2="36.6" stroke="#22D3EE" stroke-opacity="0.6" stroke-width="1.6" stroke-linecap="round"/>
+
+  <!-- Right Angled Open-Codex Folio Wing -->
+  <polygon
+    points="40,25 53,20 53,44.5 40,49.5"
+    fill="#22D3EE"
+    fill-opacity="0.16"
+    stroke="#22D3EE"
+    stroke-width="2.8"
+    stroke-linejoin="round"
+  />
+  <line x1="49" y1="28.5" x2="43.5" y2="30.6" stroke="#22D3EE" stroke-opacity="0.6" stroke-width="1.6" stroke-linecap="round"/>
+  <line x1="49" y1="34.5" x2="43.5" y2="36.6" stroke="#22D3EE" stroke-opacity="0.6" stroke-width="1.6" stroke-linecap="round"/>
+
+  <!-- Sharp Central Vertical Pillar Forming "I" -->
+  <path
+    d="M27 21.5H37V24.5H34.5V49.5H37V52.5H27V49.5H29.5V24.5H27V21.5Z"
+    fill="#22D3EE"
+  />
+
+  <!-- Signal Amber Diamond Rubrication Bookmark Accent at Spine Crown -->
+  <polygon points="32,8.5 37,13.5 32,18.5 27,13.5" fill="#F59E0B"/>
+</svg>

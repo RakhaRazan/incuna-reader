@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+build_deps/
+dist/
+backend-cpp/build/
+backend-cpp/build_deps/
+frontend/dist/
+release/
+
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Portable runtime & user data
+KomaReader.exe
+data/
+runtime/
+
+# Binaries & libraries
+*.exe
+*.dll
+
+# Databases & cover packs
+*.db
+*.db-wal
+*.db-shm
+*.pack

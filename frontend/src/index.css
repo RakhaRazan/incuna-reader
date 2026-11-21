@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Sans", "Yu Gothic UI", sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    user-select: none;
+    background-color: #f4f6f9;
+    color: #0f172a;
+  }
+
+  .dark body {
+    background-color: #0b0d10;
+    color: #f1f5f9;
+  }
+}
+
+/* Precision hairline scrollbars */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(8, 145, 178, 0.6);
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #222834;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(34, 211, 238, 0.55);
+}
+
+/* Tactical corner reticles for active / hovered cover cards */
+.tactical-reticle {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.tactical-card:hover .tactical-reticle,
+.tactical-card:focus-visible .tactical-reticle {
+  opacity: 1;
+}
