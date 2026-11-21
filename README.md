@@ -12,8 +12,8 @@
 - **2-Mode Cover Thumbnail Engine:** Zero-thrash SATA HDD-friendly cover delivery (`covers.pack` or 0 MB `ram_only` mode) with viewport priority queuing and scroll cancellation.
 - **Pro Reader Tools:**
   - **Real-Time WebGL2 Manga Enhancer:** Unsharp mask ink sharpening and black-level/white-paper normalization.
-  - **Loupe Magnifier:** Hold `Right-Click` or `L` (scroll wheel `2.5x`–`3.5x`) for an instant hardware-accelerated magnifying glass.
-  - **Auto-Scroll:** Hands-free vertical Webtoon scrolling with adjustable speed (`1x`–`5x`).
+  - **Loupe Magnifier:** Hold `Right-Click` or `L` (scroll wheel `2.5x`-`3.5x`) for an instant hardware-accelerated magnifying glass.
+  - **Auto-Scroll:** Hands-free vertical Webtoon scrolling with adjustable speed (`1x`-`5x`).
   - **Layout & Display:** Single, Dual (with smart wide-spread detection), and Vertical Webtoon modes, LTR/RTL direction, auto-border cropping, Night Mode, and Win32 true borderless fullscreen + Keep Screen Awake.
 - **Cloud & Offline Support:** Direct Google Drive & OneDrive connector, local cloud-sync folder discovery, and per-comic/batch offline pinning.
 - **Windows Integration:** Zero-UAC per-user HKCU file associations and Windows Taskbar Jump List ("Continue Reading").
