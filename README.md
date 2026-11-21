@@ -127,3 +127,16 @@ cd ..
 cmake -S backend-cpp -B backend-cpp/build -G "Visual Studio 17 2022" -A x64
 cmake --build backend-cpp/build --config Release --target IncunaReader --parallel
 ```
+
+---
+
+## Acknowledgments & Open-Source Credits
+
+Incuna Reader is licensed under the [MIT License](LICENSE) (Copyright 2026 RakhaRazan) and is powered by open-source software:
+
+- **Native Engines & Libraries:** [PDFium](https://pdfium.googlesource.com/pdfium/), [libarchive](https://www.libarchive.org/) (with zlib & liblzma), [SQLite](https://www.sqlite.org/) (WAL + FTS5), [stb](https://github.com/nothings/stb), [libwebp](https://chromium.googlesource.com/webm/libwebp), [cpp-httplib](https://github.com/yhirose/cpp-httplib), [nlohmann/json](https://github.com/nlohmann/json), and [Microsoft Edge WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (via `webview/webview`).
+- **Frontend:** [React](https://react.dev/), [Vite](https://vitejs.dev/), [Tailwind CSS](https://tailwindcss.com/), and [Lucide Icons](https://lucide.dev/).
+- **Design & Schema Inspiration:** Inspired by **Cover** and the **ComicInfo.xml** metadata standard.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for full license attributions.
+

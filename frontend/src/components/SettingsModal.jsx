@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { X, Sliders, Keyboard, HardDrive } from 'lucide-react';
+import { X, Sliders, Keyboard, HardDrive, Info } from 'lucide-react';
 import { api } from '../api/client';
 import { formatBytes } from '../utils/format';
 import {
@@ -285,6 +285,17 @@ export default function SettingsModal({
             <HardDrive className="w-3.5 h-3.5" />
             <span>Cover &amp; Storage</span>
           </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('about');
+              setRecordingAction(null);
+            }}
+            className={tabBtnCls('about')}
+          >
+            <Info className="w-3.5 h-3.5" />
+            <span>About</span>
+          </button>
         </div>
 
         {/* Body */}
@@ -331,6 +342,57 @@ export default function SettingsModal({
               onIncludePdfChange={setIncludePdfAssoc}
               onRegisterFileTypes={handleRegisterFileTypes}
             />
+          )}
+
+          {activeTab === 'about' && (
+            <div className="space-y-4 text-xs">
+              <div className="flex items-center justify-between p-3.5 rounded-lg bg-[#F4F6F9]/60 dark:bg-[#0B0D10]/60 border border-[#DCE1E8] dark:border-[#222834]">
+                <div className="flex items-center gap-3">
+                  <img src="/logo.svg" alt="Incuna Reader" className="w-8 h-8 shrink-0" />
+                  <div>
+                    <div className="text-sm font-bold text-slate-900 dark:text-[#F1F5F9]">
+                      Incuna Reader
+                    </div>
+                    <div className="text-[11px] font-mono text-cyan-700 dark:text-[#22D3EE]">
+                      v{health?.version || '0.1.0'} · MIT License · Copyright 2026 RakhaRazan
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  Open-Source Acknowledgments
+                </h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {[
+                    { name: 'PDFium', note: 'PDF rendering & metadata (BSD-3-Clause)' },
+                    { name: 'libarchive', note: 'CBR / CB7 / CBT archive streaming (BSD-2-Clause)' },
+                    { name: 'SQLite (WAL + FTS5)', note: 'Local library & full-text search (Public Domain)' },
+                    { name: 'stb & libwebp', note: 'Image decoding & WebP/JPEG encoding (MIT / BSD-3)' },
+                    { name: 'cpp-httplib & nlohmann/json', note: 'Embedded HTTP server & JSON (MIT)' },
+                    { name: 'Microsoft Edge WebView2', note: 'Native Win32 web host runtime' },
+                    { name: 'React, Vite & Tailwind CSS', note: 'Frontend UI & build toolchain (MIT)' },
+                    { name: 'Lucide Icons', note: 'Vector icon set (ISC)' },
+                  ].map((lib) => (
+                    <div
+                      key={lib.name}
+                      className="px-3 py-2 rounded-lg border border-[#DCE1E8] dark:border-[#222834] bg-[#F4F6F9]/40 dark:bg-[#0B0D10]/40"
+                    >
+                      <div className="font-semibold text-slate-900 dark:text-[#F1F5F9]">
+                        {lib.name}
+                      </div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                        {lib.note}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 pt-1">
+                  Design &amp; metadata inspiration from <span className="font-semibold text-slate-700 dark:text-slate-300">Cover</span> and <span className="font-semibold text-slate-700 dark:text-slate-300">ComicInfo.xml</span>.
+                </p>
+              </div>
+            </div>
           )}
 
           {notice && (
