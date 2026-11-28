@@ -13,22 +13,36 @@ const VerticalPageSlot = memo(function VerticalPageSlot({
 }) {
   const slotRef = useRef(null);
   const [aspectRatio, setAspectRatio] = useState(0.707);
+  const [nearViewport, setNearViewport] = useState(false);
 
   useEffect(() => {
     const el = slotRef.current;
     if (!el) return;
 
+    // 1. Generous mount/load margin so tall Webtoon slices mount before entering viewport
+    const mountObserver = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]) {
+          setNearViewport(entries[0].isIntersecting);
+        }
+      },
+      { rootMargin: '200% 0px', threshold: 0 }
+    );
+    mountObserver.observe(el);
+
+    // 2. Center-band active page tracker (works for 800x6000px slices that exceed viewport height)
     const activeObserver = new IntersectionObserver(
       (entries) => {
         if (entries[0]?.isIntersecting) {
           onVisible(pageIndex);
         }
       },
-      { threshold: 0.35 }
+      { rootMargin: '-45% 0px -45% 0px', threshold: 0 }
     );
     activeObserver.observe(el);
 
     return () => {
+      mountObserver.disconnect();
       activeObserver.disconnect();
     };
   }, [pageIndex, onVisible]);
@@ -50,13 +64,15 @@ const VerticalPageSlot = memo(function VerticalPageSlot({
       ? { width: 'min(720px, 90vw)', aspectRatio: String(aspectRatio) }
       : { ...widthStyle, aspectRatio: String(aspectRatio) };
 
+  const shouldMount = isMounted || nearViewport;
+
   return (
     <div
       ref={slotRef}
       data-page-index={pageIndex}
       className="w-full flex justify-center min-h-[360px]"
     >
-      {isMounted ? (
+      {shouldMount ? (
         <MangaPage
           src={pageUrl}
           alt={`Page ${pageIndex + 1}`}

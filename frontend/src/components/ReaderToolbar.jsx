@@ -39,6 +39,7 @@ export default function ReaderToolbar({
   autoCrop,
   mangaEnhancer,
   nightMode,
+  verticalGap = false,
   autoScrollEnabled,
   autoScrollPlaying,
   autoScrollSpeed,
@@ -49,6 +50,7 @@ export default function ReaderToolbar({
   onLayoutChange,
   onToggleCoverOffset,
   onToggleDirection,
+  onToggleVerticalGap,
   onFitChange,
   onZoomIn,
   onZoomOut,
@@ -135,6 +137,22 @@ export default function ReaderToolbar({
             <span className="hidden xl:inline">
               {t('reader.coverOffset', { defaultValue: 'Cover Offset (Page 1 Solo)' })}
             </span>
+          </button>
+        )}
+
+        {/* Seamless vs Spaced Webtoon Gap — Vertical Mode only */}
+        {layout === 'vertical' && (
+          <button
+            type="button"
+            onClick={onToggleVerticalGap}
+            title="Toggle Vertical Strip Gap (0px Seamless / 8px)"
+            className={`px-2 py-1.5 rounded-lg text-[11px] font-mono border transition-colors shrink-0 ${
+              verticalGap
+                ? 'bg-brand-600/25 border-brand-500/60 text-brand-300'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+            }`}
+          >
+            {verticalGap ? 'Gap: 8px' : 'Seamless'}
           </button>
         )}
 

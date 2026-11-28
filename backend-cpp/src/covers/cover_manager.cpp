@@ -90,6 +90,7 @@ void CoverManager::stop() {
     }
     workers_.clear();
     flush_pending_pack_batch(/*force=*/true);
+    close_pack_read_handle();
     running_.store(false, std::memory_order_release);
     lru_clear();
 }
@@ -198,39 +199,69 @@ size_t CoverManager::ram_cache_count() const {
     return lru_list_.size();
 }
 
+void CoverManager::close_pack_read_handle() {
+    std::unique_lock<std::shared_mutex> lock(pack_handle_mutex_);
+    if (pack_read_handle_) {
+        CloseHandle(static_cast<HANDLE>(pack_read_handle_));
+        pack_read_handle_ = nullptr;
+    }
+}
+
 bool CoverManager::read_from_pack(int64_t offset, int64_t size, CoverResult& out) {
     if (offset < 0 || size <= 0 || size > 32LL * 1024LL * 1024LL) return false;
 
-    std::lock_guard<std::mutex> lock(pack_io_mutex_);
-    HANDLE h = CreateFileW(
-        covers_pack_path_.c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
-        nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    auto read_with_handle = [&](HANDLE h, std::vector<uint8_t>& buf) -> bool {
+        buf.resize(static_cast<size_t>(size));
+        size_t total = 0;
+        while (total < buf.size()) {
+            const uint64_t cur_off = static_cast<uint64_t>(offset) + static_cast<uint64_t>(total);
+            OVERLAPPED ov{};
+            ov.Offset = static_cast<DWORD>(cur_off & 0xFFFFFFFFULL);
+            ov.OffsetHigh = static_cast<DWORD>((cur_off >> 32) & 0xFFFFFFFFULL);
+            DWORD got = 0;
+            const DWORD to_read = static_cast<DWORD>(buf.size() - total);
+            if (!ReadFile(h, buf.data() + total, to_read, &got, &ov) || got == 0) {
+                return false;
+            }
+            total += got;
+        }
+        return true;
+    };
 
-    LARGE_INTEGER li{};
-    li.QuadPart = offset;
-    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) {
-        CloseHandle(h);
-        return false;
+    // Fast path: concurrent read on persistent read-only HANDLE (0 CreateFileW/CloseHandle churn)
+    std::vector<uint8_t> buf;
+    bool ok = false;
+    {
+        std::shared_lock<std::shared_mutex> rlock(pack_handle_mutex_);
+        if (pack_read_handle_) {
+            ok = read_with_handle(static_cast<HANDLE>(pack_read_handle_), buf);
+        }
     }
 
-    std::vector<uint8_t> buf(static_cast<size_t>(size));
-    size_t total = 0;
-    while (total < buf.size()) {
-        DWORD got = 0;
-        const DWORD to_read = static_cast<DWORD>(buf.size() - total);
-        if (!ReadFile(h, buf.data() + total, to_read, &got, nullptr) || got == 0) {
-            CloseHandle(h);
+    if (!ok) {
+        std::unique_lock<std::shared_mutex> wlock(pack_handle_mutex_);
+        if (!pack_read_handle_) {
+            HANDLE h = CreateFileW(
+                covers_pack_path_.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+                nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            pack_read_handle_ = static_cast<void*>(h);
+        }
+        ok = read_with_handle(static_cast<HANDLE>(pack_read_handle_), buf);
+        if (!ok) {
+            // Reopen once in case pack file was truncated/rebuilt externally
+            CloseHandle(static_cast<HANDLE>(pack_read_handle_));
+            pack_read_handle_ = nullptr;
             return false;
         }
-        total += got;
     }
-    CloseHandle(h);
 
     out.found = true;
     out.mime_type = is_webp_bytes(buf) ? "image/webp" : "image/jpeg";
@@ -295,7 +326,7 @@ bool CoverManager::flush_pending_pack_batch_locked(bool force) {
         HANDLE h = CreateFileW(
             covers_pack_path_.c_str(),
             GENERIC_WRITE,
-            FILE_SHARE_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
@@ -536,6 +567,12 @@ CoverResult CoverManager::get_cover(int64_t comic_id) {
     }
     queue_cv_.notify_one();
 
+    if (future.wait_for(std::chrono::seconds(8)) != std::future_status::ready) {
+        cancel_ids({comic_id});
+        CoverResult timeout_res;
+        timeout_res.cancelled = true;
+        return timeout_res;
+    }
     return future.get();
 }
 
@@ -964,6 +1001,7 @@ CoverPackStatus CoverManager::get_pack_status() const {
 
 bool CoverManager::purge_pack() {
     clear_queue();
+    close_pack_read_handle();
 
     {
         std::lock_guard<std::mutex> lock(pack_io_mutex_);
@@ -983,6 +1021,7 @@ bool CoverManager::purge_pack() {
 
 bool CoverManager::rebuild_pack() {
     clear_queue();
+    close_pack_read_handle();
 
     {
         std::lock_guard<std::mutex> lock(pack_io_mutex_);
@@ -993,7 +1032,7 @@ bool CoverManager::rebuild_pack() {
         HANDLE h = CreateFileW(
             covers_pack_path_.c_str(),
             GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,

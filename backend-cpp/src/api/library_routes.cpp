@@ -1,5 +1,11 @@
 #include "api/library_routes.hpp"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <shellapi.h>
+
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
@@ -14,7 +20,9 @@
 #include <nlohmann/json.hpp>
 
 #include "cloud/cloud_client.hpp"
+#include "covers/cover_manager.hpp"
 #include "db/database.hpp"
+#include "formats/reader_session.hpp"
 #include "portable_paths.hpp"
 #include "utils/json_helpers.hpp"
 #include "utils/string_utils.hpp"
@@ -600,6 +608,127 @@ void register_library_routes(httplib::Server& server, LibraryRouteContext ctx) {
             return;
         }
         send_json(res, {{"id", comic_id}, {"hidden", hidden}, {"is_hidden", hidden}});
+    }));
+
+    // ---- Per-Comic Reading Profile (v1.1.0) ----
+    auto handle_reading_profile = guarded([ctx](const httplib::Request& req, httplib::Response& res) {
+        int64_t comic_id = 0;
+        if (!match_int64(req, 1, comic_id) || comic_id <= 0) {
+            send_error(res, "Invalid comic id", 400);
+            return;
+        }
+        nlohmann::json body;
+        if (!parse_json_object(req, body, res)) return;
+
+        const std::string mode = body.value("reading_mode", "");
+        const std::string dir  = body.value("reading_dir", "");
+        const std::string fit  = body.value("fit_mode", "");
+
+        if (!mode.empty() && mode != "single" && mode != "dual" && mode != "vertical") {
+            send_error(res, "Invalid 'reading_mode' (expected '', 'single', 'dual', or 'vertical')", 400);
+            return;
+        }
+        if (!dir.empty() && dir != "rtl" && dir != "ltr") {
+            send_error(res, "Invalid 'reading_dir' (expected '', 'rtl', or 'ltr')", 400);
+            return;
+        }
+        if (!fit.empty() && fit != "fit-height" && fit != "fit-width" && fit != "original" &&
+            fit != "fitPage" && fit != "fitWidth" && fit != "fitHeight") {
+            send_error(res, "Invalid 'fit_mode'", 400);
+            return;
+        }
+
+        if (!ctx.db.update_comic_reading_profile(comic_id, mode, dir, fit)) {
+            send_error(res, "Comic not found", 404);
+            return;
+        }
+        send_json(res, {
+            {"id", comic_id},
+            {"reading_mode", mode},
+            {"reading_dir", dir},
+            {"fit_mode", fit}
+        });
+    });
+    server.Post(R"(/api/library/comic/(\d+)/reading-profile)", handle_reading_profile);
+    server.Put(R"(/api/library/comic/(\d+)/reading-profile)", handle_reading_profile);
+    server.Patch(R"(/api/library/comic/(\d+)/reading-profile)", handle_reading_profile);
+
+    // ---- Safe Recycle Bin Delete (releases active ReaderSession handle before SHFileOperationW) ----
+    server.Delete(R"(/api/library/comic/(\d+))", guarded([ctx](const httplib::Request& req, httplib::Response& res) {
+        int64_t comic_id = 0;
+        if (!match_int64(req, 1, comic_id) || comic_id <= 0) {
+            send_error(res, "Invalid comic id", 400);
+            return;
+        }
+
+        ComicRecord comic;
+        if (!ctx.db.get_comic(comic_id, comic)) {
+            send_error(res, "Comic not found", 404);
+            return;
+        }
+
+        const bool delete_disk = query_bool(req, "delete_disk", false);
+        const std::wstring comic_wpath = utf8_to_wide(comic.path);
+        const std::wstring comic_lower = to_lower_wide(comic_wpath);
+        const std::wstring offline_wpath = utf8_to_wide(comic.offline_path);
+        const std::wstring offline_lower = to_lower_wide(offline_wpath);
+
+        // 1. Always release active ReaderSession file handle FIRST if this comic is currently open
+        if (ctx.reader_session.is_open()) {
+            const std::wstring active_lower = to_lower_wide(ctx.reader_session.current_path());
+            if (!active_lower.empty() &&
+                (active_lower == comic_lower || (!offline_lower.empty() && active_lower == offline_lower))) {
+                ctx.reader_session.close();
+            }
+        }
+
+        // 2. Cancel any queued cover extraction for this comic
+        ctx.cover_manager.cancel_ids({comic_id});
+
+        // 3. Optionally send file to Windows Recycle Bin via SHFileOperationW
+        bool deleted_from_disk = false;
+        if (delete_disk && !comic_wpath.empty()) {
+            std::error_code ec;
+            if (std::filesystem::exists(comic_wpath, ec)) {
+                std::wstring double_null_path = comic_wpath;
+                double_null_path.push_back(L'\0');
+                double_null_path.push_back(L'\0');
+
+                SHFILEOPSTRUCTW op{};
+                op.wFunc = FO_DELETE;
+                op.pFrom = double_null_path.c_str();
+                op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+
+                int rc = 0;
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    op.fAnyOperationsAborted = FALSE;
+                    rc = SHFileOperationW(&op);
+                    if (rc != ERROR_SHARING_VIOLATION) {
+                        break;
+                    }
+                    Sleep(150);
+                }
+                if (rc != 0 || op.fAnyOperationsAborted) {
+                    send_error(res, "Failed to move file to Recycle Bin (SHFileOperationW code " + std::to_string(rc) + ")", 500);
+                    return;
+                }
+                deleted_from_disk = true;
+            }
+            if (comic.is_offline_pinned && !offline_wpath.empty()) {
+                std::filesystem::remove(offline_wpath, ec);
+            }
+        }
+
+        // 4. Remove DB row and refresh Jump List
+        const bool db_deleted = ctx.db.delete_comic_by_path(comic.path);
+        if (db_deleted && ctx.refresh_jumplist) {
+            ctx.refresh_jumplist();
+        }
+        send_json(res, {
+            {"deleted", db_deleted},
+            {"id", comic_id},
+            {"deleted_from_disk", deleted_from_disk}
+        });
     }));
 
     // ---- Batch Comic Actions ----

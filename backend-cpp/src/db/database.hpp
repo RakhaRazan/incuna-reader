@@ -46,6 +46,9 @@ struct ComicRecord {
     std::string author;
     std::string tags;
     std::string language;
+    std::string reading_mode;
+    std::string reading_dir;
+    std::string fit_mode;
 
     nlohmann::json to_json() const {
         return nlohmann::json{
@@ -69,7 +72,10 @@ struct ComicRecord {
             {"series", series},
             {"author", author},
             {"tags", tags},
-            {"language", language}
+            {"language", language},
+            {"reading_mode", reading_mode},
+            {"reading_dir", reading_dir},
+            {"fit_mode", fit_mode}
         };
     }
 };
@@ -207,6 +213,10 @@ public:
                                int page_count,
                                const std::string& status,
                                int is_favorite_opt /* -1 = keep */);
+    bool update_comic_reading_profile(int64_t id,
+                                      const std::string& mode,
+                                      const std::string& dir,
+                                      const std::string& fit);
     bool batch_update_comic_cover_pack(const std::vector<CoverPackUpdate>& updates);
     bool reset_all_cover_pack_offsets();
     bool update_comic_offline_pin(int64_t id, bool pinned, const std::string& offline_path);
@@ -254,7 +264,9 @@ private:
     bool seed_builtin_smartviews();
 
     sqlite3* db_ = nullptr;
+    sqlite3* read_db_ = nullptr;
     mutable std::mutex mutex_;
+    mutable std::mutex read_mutex_;
     std::string last_error_;
 };
 

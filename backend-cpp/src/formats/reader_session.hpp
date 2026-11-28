@@ -59,7 +59,7 @@ private:
     std::filesystem::path stream_cache_dir_;
 
     mutable std::mutex state_mutex_;
-    std::unique_ptr<ComicReader> reader_;
+    std::shared_ptr<ComicReader> reader_;
     std::wstring current_path_;
     std::string session_id_;
     std::string last_error_;

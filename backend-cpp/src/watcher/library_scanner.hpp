@@ -93,8 +93,15 @@ private:
         int64_t folder_id = 0;
     };
 
+    struct MetadataJob {
+        std::filesystem::path file_path;
+        ComicUpsert base_item;
+    };
+
     void scan_worker_loop();
     void process_scan_job(const ScanJob& job);
+    void enqueue_metadata_jobs(std::vector<MetadataJob>& jobs);
+    void metadata_worker_loop();
     void watcher_thread_func(std::wstring folder_path, void* stop_event);
 
     Database& db_;
@@ -116,6 +123,13 @@ private:
     bool scan_job_active_ = false;
     bool stop_scanner_ = false;
     std::thread scan_thread_;
+
+    // Deferred background metadata extraction queue (keeps 30,000-file import non-blocking)
+    std::mutex meta_queue_mutex_;
+    std::condition_variable meta_queue_cv_;
+    std::deque<MetadataJob> meta_queue_;
+    bool stop_meta_worker_ = false;
+    std::thread meta_thread_;
 
     std::mutex watchers_mutex_;
     std::unordered_map<std::wstring, std::unique_ptr<WatcherHandle>> watchers_;

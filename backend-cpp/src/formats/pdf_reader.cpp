@@ -1,6 +1,7 @@
 #include "formats/comic_reader.hpp"
 #include "formats/image_utils.hpp"
 #include "formats/pdfium_runtime.hpp"
+#include "utils/string_utils.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -245,14 +246,17 @@ std::string fpdf_error_string(unsigned long err) {
     }
 }
 
+struct RawPdfBitmap {
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+    int format = 0;
+    std::vector<uint8_t> bytes;
+};
+
 // Fast-path embedded image extraction for single-image manga PDF pages (Page 0).
-// Must be called while pdfium_global_mutex() is held.
-bool extract_single_image_thumbnail(FPDF_PAGE page,
-                                    int max_w,
-                                    int max_h,
-                                    DecodedImage& out_decoded,
-                                    int& out_orig_w,
-                                    int& out_orig_h) {
+// Copies raw bitmap bytes under pdfium_global_mutex() so CPU downsampling runs unlocked.
+bool extract_single_image_raw_locked(FPDF_PAGE page, RawPdfBitmap& out_raw) {
     if (FPDFPage_GetRotation(page) != 0) {
         return false;
     }
@@ -296,6 +300,31 @@ bool extract_single_image_thumbnail(FPDF_PAGE page,
         default: return false;
     }
     if (stride < src_w * bpp) {
+        return false;
+    }
+
+    out_raw.width = src_w;
+    out_raw.height = src_h;
+    out_raw.stride = stride;
+    out_raw.format = fmt;
+    const size_t total_bytes = static_cast<size_t>(stride) * static_cast<size_t>(src_h);
+    out_raw.bytes.assign(src_buf, src_buf + total_bytes);
+    return true;
+}
+
+// Runs CPU downsampling OUTSIDE pdfium_global_mutex() so active PDF reading is never stalled.
+bool downsample_pdf_bitmap(const RawPdfBitmap& raw,
+                           int max_w,
+                           int max_h,
+                           DecodedImage& out_decoded,
+                           int& out_orig_w,
+                           int& out_orig_h) {
+    const int src_w = raw.width;
+    const int src_h = raw.height;
+    const int stride = raw.stride;
+    const int fmt = raw.format;
+    const uint8_t* src_buf = raw.bytes.data();
+    if (!src_buf || src_w <= 0 || src_h <= 0 || stride <= 0) {
         return false;
     }
 
@@ -454,8 +483,9 @@ public:
         std::lock_guard<std::mutex> doc_lock(doc_mutex_);
         close_locked();
 
+        const std::wstring long_path = to_win32_long_path(path);
         HANDLE h = CreateFileW(
-            path.c_str(),
+            long_path.c_str(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
@@ -474,6 +504,12 @@ public:
             return false;
         }
 
+        if (size_li.QuadPart > static_cast<LONGLONG>((std::numeric_limits<unsigned long>::max)())) {
+            CloseHandle(h);
+            last_error_ = "PDF exceeds 4 GB Win32 PDFium 32-bit stream limit";
+            return false;
+        }
+
         PdfiumRuntime::acquire();
         pdfium_acquired_ = true;
 
@@ -481,9 +517,7 @@ public:
         stream_->handle = h;
         stream_->file_size = size_li.QuadPart;
 
-        file_access_.m_FileLen = (size_li.QuadPart > static_cast<int64_t>(std::numeric_limits<unsigned long>::max()))
-            ? std::numeric_limits<unsigned long>::max()
-            : static_cast<unsigned long>(size_li.QuadPart);
+        file_access_.m_FileLen = static_cast<unsigned long>(size_li.QuadPart);
         file_access_.m_GetBlock = &win64_pdf_get_block;
         file_access_.m_Param = stream_.get();
 
@@ -593,6 +627,7 @@ private:
         }
 
         DecodedImage decoded;
+        RawPdfBitmap raw_embedded;
         int orig_w = 0;
         int orig_h = 0;
         bool used_embedded_fast_path = false;
@@ -607,10 +642,10 @@ private:
                 return {};
             }
 
-            // Fast-path for single-image manga PDF covers: extract embedded image bitmap
-            // directly and downscale smoothly without running full PDF page composition.
+            // Fast-path for single-image manga PDF covers: copy embedded bitmap bytes under
+            // pdfium_global_mutex(), then downsample outside the lock.
             if (is_thumbnail && index == 0 &&
-                extract_single_image_thumbnail(page.get(), target_width, max_height, decoded, orig_w, orig_h)) {
+                extract_single_image_raw_locked(page.get(), raw_embedded)) {
                 used_embedded_fast_path = true;
             } else {
                 const double pt_w = FPDF_GetPageWidth(page.get());
@@ -671,7 +706,11 @@ private:
             }
         }
 
-        if (!used_embedded_fast_path) {
+        if (used_embedded_fast_path) {
+            if (!downsample_pdf_bitmap(raw_embedded, target_width, max_height, decoded, orig_w, orig_h)) {
+                return {};
+            }
+        } else {
             // Convert BGRA -> RGBA in place
             const size_t pixel_count = static_cast<size_t>(decoded.width) * static_cast<size_t>(decoded.height);
             uint8_t* p = decoded.rgba.data();

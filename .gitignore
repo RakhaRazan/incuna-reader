@@ -10,6 +10,7 @@ release/
 # Dependencies
 node_modules/
 frontend/node_modules/
+vcpkg_installed/
 
 # Portable runtime & user data
 IncunaReader.exe
@@ -20,6 +21,8 @@ runtime/
 # Binaries & libraries
 *.exe
 *.dll
+*.pdb
+*.zip
 
 # Databases & cover packs
 *.db

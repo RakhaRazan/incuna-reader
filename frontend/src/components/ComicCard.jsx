@@ -51,6 +51,7 @@ export function CoverImage({ comicId, coverVersion, title, deferCover, isFolder 
   const [retryCount, setRetryCount] = useState(0);
   const [failed, setFailed] = useState(false);
   const retryTimerRef = useRef(null);
+  const imgRef = useRef(null);
 
   useEffect(() => {
     if (retryTimerRef.current) {
@@ -99,6 +100,7 @@ export function CoverImage({ comicId, coverVersion, title, deferCover, isFolder 
     if (!canMountImg || failed) return;
 
     let disposed = false;
+    let activeImg = null;
     setLoaded(false);
 
     const cancelQueued = enqueueCoverLoad(
@@ -110,6 +112,7 @@ export function CoverImage({ comicId, coverVersion, title, deferCover, isFolder 
           }
 
           const img = new Image();
+          activeImg = img;
           img.decoding = 'async';
           let settled = false;
 
@@ -161,6 +164,15 @@ export function CoverImage({ comicId, coverVersion, title, deferCover, isFolder 
     return () => {
       disposed = true;
       cancelQueued();
+      if (activeImg) {
+        activeImg.onload = null;
+        activeImg.onerror = null;
+        activeImg.src = '';
+        activeImg = null;
+      }
+      if (imgRef.current) {
+        imgRef.current.src = '';
+      }
     };
   }, [canMountImg, failed, src, retryCount]);
 
@@ -191,6 +203,7 @@ export function CoverImage({ comicId, coverVersion, title, deferCover, isFolder 
       )}
       {decodedSrc && (
         <img
+          ref={imgRef}
           src={decodedSrc}
           alt=""
           decoding="async"

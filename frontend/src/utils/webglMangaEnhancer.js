@@ -202,6 +202,13 @@ export function isWebGL2Available() {
   return Boolean(getSharedRenderer());
 }
 
+export function releaseEnhancerMemory() {
+  if (sharedState?.canvas) {
+    sharedState.canvas.width = 1;
+    sharedState.canvas.height = 1;
+  }
+}
+
 /**
  * Renders an HTMLImageElement through the WebGL2 manga enhancer shader
  * and blits the result onto targetCanvas.
@@ -218,14 +225,13 @@ export function renderEnhancedMangaToCanvas(img, targetCanvas, options = DEFAULT
   const { canvas: glCanvas, gl, program, vao, texture, uniforms, maxTextureSize } = renderer;
 
   try {
-    let w = img.naturalWidth;
-    let h = img.naturalHeight;
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || maxTextureSize;
+    const w = img.naturalWidth;
+    const h = img.naturalHeight;
 
-    // Respect GPU MAX_TEXTURE_SIZE for ultra-tall webtoon strips
-    if (w > maxTextureSize || h > maxTextureSize) {
-      const scale = Math.min(maxTextureSize / w, maxTextureSize / h);
-      w = Math.max(1, Math.floor(w * scale));
-      h = Math.max(1, Math.floor(h * scale));
+    // Gracefully fall back to native <img> for ultra-tall webtoon strips exceeding GPU MAX_TEXTURE_SIZE
+    if (w > maxTex || h > maxTex) {
+      return false;
     }
 
     if (glCanvas.width !== w || glCanvas.height !== h) {
@@ -241,6 +247,9 @@ export function renderEnhancedMangaToCanvas(img, targetCanvas, options = DEFAULT
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    if (gl.getError() !== gl.NO_ERROR) {
+      return false;
+    }
 
     gl.uniform1i(uniforms.u_image, 0);
     gl.uniform2f(uniforms.u_texelSize, 1.0 / w, 1.0 / h);
@@ -249,6 +258,9 @@ export function renderEnhancedMangaToCanvas(img, targetCanvas, options = DEFAULT
     gl.uniform1f(uniforms.u_whiteLevel, options.whiteLevel ?? DEFAULT_OPTIONS.whiteLevel);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (gl.getError() !== gl.NO_ERROR) {
+      return false;
+    }
 
     if (targetCanvas.width !== w || targetCanvas.height !== h) {
       targetCanvas.width = w;

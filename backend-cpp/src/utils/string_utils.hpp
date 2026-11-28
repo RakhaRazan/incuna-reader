@@ -78,4 +78,26 @@ inline std::string escape_sql_like(const std::string& s) {
     return out;
 }
 
+inline std::wstring to_win32_long_path(const std::wstring& path) {
+    if (path.empty()) return path;
+    std::wstring norm = path;
+    for (wchar_t& ch : norm) {
+        if (ch == L'/') ch = L'\\';
+    }
+    if (norm.size() >= 4 &&
+        norm[0] == L'\\' && norm[1] == L'\\' &&
+        (norm[2] == L'?' || norm[2] == L'.') && norm[3] == L'\\') {
+        return norm;
+    }
+    if (norm.size() >= 2 && norm[0] == L'\\' && norm[1] == L'\\') {
+        return L"\\\\?\\UNC\\" + norm.substr(2);
+    }
+    if (norm.size() >= 3 &&
+        ((norm[0] >= L'A' && norm[0] <= L'Z') || (norm[0] >= L'a' && norm[0] <= L'z')) &&
+        norm[1] == L':' && norm[2] == L'\\') {
+        return L"\\\\?\\" + norm;
+    }
+    return norm;
+}
+
 } // namespace koma

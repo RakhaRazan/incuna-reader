@@ -59,7 +59,7 @@ export default function CloudImportModal({
 
   useEffect(() => {
     if (!open) return;
-    setClientId(localStorage.getItem(`koma_cloud_cid_${provider}`) || '');
+    setClientId(localStorage.getItem(`incuna_cloud_cid_${provider}`) || '');
     setClientSecret('');
     setFolderTrail([{ id: 'root', name: provider === 'gdrive' ? 'My Drive' : 'OneDrive' }]);
     setSelectedMap(new Map());
@@ -180,7 +180,7 @@ export default function CloudImportModal({
     e.preventDefault();
     const trimmedId = clientId.trim();
     if (!trimmedId || authBusy) return;
-    localStorage.setItem(`koma_cloud_cid_${provider}`, trimmedId);
+    localStorage.setItem(`incuna_cloud_cid_${provider}`, trimmedId);
     setAuthBusy(true);
     setAuthError('');
     setNotice('');

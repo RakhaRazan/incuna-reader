@@ -26,6 +26,7 @@ export default function ContextMenu({
   onToggleHidden,
   onAssignShelf,
   onRemoveFromShelf,
+  onDeleteComic,
   onFilterAuthor,
   onFilterTag,
 }) {
@@ -153,6 +154,23 @@ export default function ContextMenu({
         >
           <Trash2 className="w-3.5 h-3.5" />
           <span>{t('contextMenu.removeFromShelf')}</span>
+        </button>
+      )}
+
+      {onDeleteComic && (
+        <button
+          type="button"
+          onClick={() => {
+            const label = comic.title || comic.path;
+            if (window.confirm(`Move "${label}" to Windows Recycle Bin?`)) {
+              onDeleteComic(comic);
+            }
+            onClose();
+          }}
+          className="w-full px-3 py-1.5 flex items-center gap-2 text-rose-500 hover:bg-rose-500/10"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+          <span>{t('contextMenu.moveToRecycleBin', { defaultValue: 'Move to Recycle Bin' })}</span>
         </button>
       )}
 

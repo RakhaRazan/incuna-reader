@@ -9,7 +9,12 @@ export class ApiError extends Error {
 }
 
 async function request(url, options = {}) {
-  const res = await fetch(url, options);
+  const token = typeof window !== 'undefined' ? window.__INCUNA_TOKEN__ || '' : '';
+  const headers = { ...(options.headers || {}) };
+  if (token) {
+    headers['X-Incuna-Token'] = token;
+  }
+  const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
     try {
@@ -294,5 +299,15 @@ export const api = {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify(payload),
+    }),
+  saveReadingProfile: (comicId, profile) =>
+    request(`/api/library/comic/${comicId}/reading-profile`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(profile),
+    }),
+  deleteComic: (comicId, deleteDisk = false) =>
+    request(`/api/library/comic/${comicId}${deleteDisk ? '?delete_disk=1' : ''}`, {
+      method: 'DELETE',
     }),
 };

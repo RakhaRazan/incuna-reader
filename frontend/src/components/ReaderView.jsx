@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { ChevronLeft, ChevronRight, ArrowRight } from 'lucide-react';
 import { api, isAbortError } from '../api/client';
 import { formatDisplayTitle } from '../utils/format';
+import { releaseEnhancerMemory } from '../utils/webglMangaEnhancer';
 import { useReaderShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useLoupeMagnifier } from '../hooks/useLoupeMagnifier';
 import ReaderToolbar from './ReaderToolbar';
@@ -16,6 +17,14 @@ const AUTO_SCROLL_SPEEDS = [0, 45, 90, 150, 230, 340]; // px/sec for 1x..5x
 const NIGHT_MODE_FILTER =
   'invert(0.92) hue-rotate(180deg) sepia(0.18) brightness(0.95) contrast(1.05)';
 
+function normalizeFitMode(raw) {
+  if (raw === 'fit-width' || raw === 'fitWidth') return 'fitWidth';
+  if (raw === 'fit-height' || raw === 'fitHeight') return 'fitHeight';
+  if (raw === 'original') return 'original';
+  if (raw === 'fitPage') return 'fitPage';
+  return '';
+}
+
 export default function ReaderView({ comic, activeShelfId = 0, settings = null, onOpenComic, onClose, onProgressSaved }) {
   const { t } = useTranslation();
 
@@ -25,39 +34,50 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
   const [currentPage, setCurrentPage] = useState(0);
 
   const [layout, setLayout] = useState(() => {
+    if (comic.reading_mode === 'single' || comic.reading_mode === 'dual' || comic.reading_mode === 'vertical') {
+      return comic.reading_mode;
+    }
     if (settings?.stack_pages_vertically) return 'vertical';
-    const saved = localStorage.getItem('koma_reader_layout');
-    return saved === 'dual' ? 'dual' : 'single';
+    const saved = localStorage.getItem('incuna_reader_layout');
+    if (saved === 'dual' || saved === 'vertical' || saved === 'single') return saved;
+    return 'single';
   });
-  const [coverOffset, setCoverOffset] = useState(() => localStorage.getItem('koma_reader_cover_offset') !== '0');
+  const [coverOffset, setCoverOffset] = useState(() => localStorage.getItem('incuna_reader_cover_offset') !== '0');
+  const [verticalGap, setVerticalGap] = useState(() => localStorage.getItem('incuna_reader_vertical_gap') === '1');
   const [direction, setDirection] = useState(() => {
+    if (comic.reading_dir === 'rtl' || comic.reading_dir === 'ltr') return comic.reading_dir;
     if (settings && typeof settings.default_manga_mode === 'boolean') {
       return settings.default_manga_mode ? 'rtl' : 'ltr';
     }
-    return localStorage.getItem('koma_reader_dir') || 'rtl';
+    return localStorage.getItem('incuna_reader_dir') || 'rtl';
   });
-  const [fit, setFit] = useState(() => localStorage.getItem('koma_reader_fit') || 'fitPage');
-  const [bgColor, setBgColor] = useState(() => localStorage.getItem('koma_reader_bg') || '#000000');
+  const [fit, setFit] = useState(() => {
+    const storedFit = normalizeFitMode(comic.fit_mode);
+    if (storedFit) return storedFit;
+    return localStorage.getItem('incuna_reader_fit') || 'fitPage';
+  });
+  const [bgColor, setBgColor] = useState(() => localStorage.getItem('incuna_reader_bg') || '#000000');
   const [autoCrop, setAutoCrop] = useState(() => {
     if (settings && typeof settings.auto_detect_borders === 'boolean') {
       return settings.auto_detect_borders;
     }
-    return localStorage.getItem('koma_reader_crop') === '1';
+    return localStorage.getItem('incuna_reader_crop') === '1';
   });
   const [mangaEnhancer, setMangaEnhancer] = useState(() => {
     if (settings && typeof settings.enable_manga_enhancer === 'boolean') {
       return settings.enable_manga_enhancer;
     }
-    return localStorage.getItem('koma_reader_enhancer') === '1';
+    return localStorage.getItem('incuna_reader_enhancer') === '1';
   });
-  const [nightMode, setNightMode] = useState(() => localStorage.getItem('koma_reader_night') === '1');
+  const [nightMode, setNightMode] = useState(() => localStorage.getItem('incuna_reader_night') === '1');
   const [autoScrollPlaying, setAutoScrollPlaying] = useState(false);
   const [autoScrollSpeed, setAutoScrollSpeed] = useState(() => {
-    const saved = Number(localStorage.getItem('koma_reader_autoscroll_speed'));
+    const saved = Number(localStorage.getItem('incuna_reader_autoscroll_speed'));
     return saved >= 1 && saved <= 5 ? saved : 2;
   });
   const [controlsVisible, setControlsVisible] = useState(true);
   const [widePages, setWidePages] = useState(() => new Set());
+  const autoDetectedWebtoonRef = useRef(false);
 
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -74,15 +94,56 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
   const touchRef = useRef({ startX: 0, startY: 0, lastTap: 0, pinchDist: 0, startZoom: 1 });
   const pointerDownRef = useRef(false);
 
-  useEffect(() => { localStorage.setItem('koma_reader_layout', layout); }, [layout]);
-  useEffect(() => { localStorage.setItem('koma_reader_cover_offset', coverOffset ? '1' : '0'); }, [coverOffset]);
-  useEffect(() => { localStorage.setItem('koma_reader_dir', direction); }, [direction]);
-  useEffect(() => { localStorage.setItem('koma_reader_fit', fit); }, [fit]);
-  useEffect(() => { localStorage.setItem('koma_reader_bg', bgColor); }, [bgColor]);
-  useEffect(() => { localStorage.setItem('koma_reader_crop', autoCrop ? '1' : '0'); }, [autoCrop]);
-  useEffect(() => { localStorage.setItem('koma_reader_enhancer', mangaEnhancer ? '1' : '0'); }, [mangaEnhancer]);
-  useEffect(() => { localStorage.setItem('koma_reader_night', nightMode ? '1' : '0'); }, [nightMode]);
-  useEffect(() => { localStorage.setItem('koma_reader_autoscroll_speed', String(autoScrollSpeed)); }, [autoScrollSpeed]);
+  useEffect(() => { localStorage.setItem('incuna_reader_layout', layout); }, [layout]);
+  useEffect(() => { localStorage.setItem('incuna_reader_cover_offset', coverOffset ? '1' : '0'); }, [coverOffset]);
+  useEffect(() => { localStorage.setItem('incuna_reader_vertical_gap', verticalGap ? '1' : '0'); }, [verticalGap]);
+  useEffect(() => { localStorage.setItem('incuna_reader_dir', direction); }, [direction]);
+  useEffect(() => { localStorage.setItem('incuna_reader_fit', fit); }, [fit]);
+  useEffect(() => { localStorage.setItem('incuna_reader_bg', bgColor); }, [bgColor]);
+  useEffect(() => { localStorage.setItem('incuna_reader_crop', autoCrop ? '1' : '0'); }, [autoCrop]);
+  useEffect(() => { localStorage.setItem('incuna_reader_enhancer', mangaEnhancer ? '1' : '0'); }, [mangaEnhancer]);
+  useEffect(() => { localStorage.setItem('incuna_reader_night', nightMode ? '1' : '0'); }, [nightMode]);
+  useEffect(() => { localStorage.setItem('incuna_reader_autoscroll_speed', String(autoScrollSpeed)); }, [autoScrollSpeed]);
+
+  const persistReadingProfile = useCallback(
+    (nextMode, nextDir, nextFit) => {
+      if (!comic.id || comic.id <= 0) return;
+      api
+        .saveReadingProfile(comic.id, {
+          reading_mode: nextMode,
+          reading_dir: nextDir,
+          fit_mode: nextFit,
+        })
+        .catch(() => {});
+    },
+    [comic.id]
+  );
+
+  const handleLayoutChange = useCallback(
+    (nextLayout) => {
+      setLayout(nextLayout);
+      persistReadingProfile(nextLayout, direction, fit);
+    },
+    [direction, fit, persistReadingProfile]
+  );
+
+  const handleToggleDirection = useCallback(() => {
+    setDirection((d) => {
+      const next = d === 'rtl' ? 'ltr' : 'rtl';
+      persistReadingProfile(layout, next, fit);
+      return next;
+    });
+  }, [layout, fit, persistReadingProfile]);
+
+  const handleFitChange = useCallback(
+    (nextFit) => {
+      setFit(nextFit);
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+      persistReadingProfile(layout, direction, nextFit);
+    },
+    [layout, direction, persistReadingProfile]
+  );
 
   const smartPageLayout = settings?.smart_page_layout ?? true;
   const keepScreenActive = settings?.keep_screen_active ?? true;
@@ -131,6 +192,31 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
     setBookmarksOpen(false);
     setAutoScrollPlaying(false);
     setWidePages(new Set());
+    autoDetectedWebtoonRef.current = false;
+
+    if (comic.reading_mode === 'single' || comic.reading_mode === 'dual' || comic.reading_mode === 'vertical') {
+      setLayout(comic.reading_mode);
+    } else if (settings?.stack_pages_vertically) {
+      setLayout('vertical');
+    } else {
+      const savedLayout = localStorage.getItem('incuna_reader_layout');
+      setLayout(savedLayout === 'dual' || savedLayout === 'vertical' || savedLayout === 'single' ? savedLayout : 'single');
+    }
+
+    if (comic.reading_dir === 'rtl' || comic.reading_dir === 'ltr') {
+      setDirection(comic.reading_dir);
+    } else if (settings && typeof settings.default_manga_mode === 'boolean') {
+      setDirection(settings.default_manga_mode ? 'rtl' : 'ltr');
+    } else {
+      setDirection(localStorage.getItem('incuna_reader_dir') || 'rtl');
+    }
+
+    const storedFit = normalizeFitMode(comic.fit_mode);
+    if (storedFit) {
+      setFit(storedFit);
+    } else {
+      setFit(localStorage.getItem('incuna_reader_fit') || 'fitPage');
+    }
 
     const payload = comic.id ? { comic_id: comic.id } : { path: comic.path };
     api
@@ -170,6 +256,7 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
     return () => {
       controller.abort();
       api.closeReader().catch(() => {});
+      releaseEnhancerMemory();
     };
   }, [comic.id, comic.path, activeShelfId, t]);
 
@@ -183,6 +270,18 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
 
   const markWidePageIfSpread = useCallback((idx, img) => {
     if (!img || !img.naturalWidth || !img.naturalHeight) return;
+    if (
+      idx === 0 &&
+      !comic.reading_mode &&
+      !autoDetectedWebtoonRef.current &&
+      img.naturalHeight / img.naturalWidth > 2.2
+    ) {
+      autoDetectedWebtoonRef.current = true;
+      setLayout('vertical');
+      setDirection('ltr');
+      setFit('fitWidth');
+      persistReadingProfile('vertical', 'ltr', 'fitWidth');
+    }
     if (img.naturalWidth > img.naturalHeight * 1.15) {
       setWidePages((prev) => {
         if (prev.has(idx)) return prev;
@@ -279,6 +378,19 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
     }, 180);
     return () => clearTimeout(timer);
   }, [session, comic.id, currentPage, pageCount, layout, spreadPages.join(','), onProgressSaved]);
+
+  const handleVerticalScroll = useCallback(
+    (e) => {
+      if (pageCount <= 0) return;
+      const el = e.currentTarget;
+      if (el.scrollTop <= 2) {
+        setCurrentPage(0);
+      } else if (el.scrollTop + el.clientHeight >= el.scrollHeight - 4) {
+        setCurrentPage(pageCount - 1);
+      }
+    },
+    [pageCount]
+  );
 
   const isFullscreenRef = useRef(false);
   isFullscreenRef.current = isFullscreen;
@@ -430,13 +542,15 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
       if (adjacent?.prev && onOpenComic) onOpenComic(adjacent.prev);
     },
     onToggleFullscreen: toggleFullscreen,
-    onToggleDirection: () => setDirection((d) => (d === 'rtl' ? 'ltr' : 'rtl')),
-    onCycleLayout: () =>
-      setLayout((l) => (l === 'single' ? 'dual' : l === 'dual' ? 'vertical' : 'single')),
+    onToggleDirection: handleToggleDirection,
+    onCycleLayout: () => {
+      const next = layout === 'single' ? 'dual' : layout === 'dual' ? 'vertical' : 'single';
+      handleLayoutChange(next);
+    },
     onCycleFit: () => {
       const order = ['fitPage', 'fitWidth', 'fitHeight', 'original'];
-      setFit((f) => order[(order.indexOf(f) + 1) % order.length]);
-      resetZoom();
+      const next = order[(order.indexOf(fit) + 1) % order.length];
+      handleFitChange(next);
     },
     onToggleNightMode: () => setNightMode((v) => !v),
     onToggleControls: () => setControlsVisible((v) => !v),
@@ -672,6 +786,7 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
         autoCrop={autoCrop}
         mangaEnhancer={mangaEnhancer}
         nightMode={nightMode}
+        verticalGap={verticalGap}
         autoScrollEnabled={autoScrollEnabled}
         autoScrollPlaying={autoScrollPlaying}
         autoScrollSpeed={autoScrollSpeed}
@@ -679,13 +794,11 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
         bookmarksCount={bookmarks.length}
         isFullscreen={isFullscreen}
         onClose={onClose}
-        onLayoutChange={setLayout}
+        onLayoutChange={handleLayoutChange}
         onToggleCoverOffset={() => setCoverOffset((v) => !v)}
-        onToggleDirection={() => setDirection((d) => (d === 'rtl' ? 'ltr' : 'rtl'))}
-        onFitChange={(nextFit) => {
-          setFit(nextFit);
-          resetZoom();
-        }}
+        onToggleDirection={handleToggleDirection}
+        onToggleVerticalGap={() => setVerticalGap((v) => !v)}
+        onFitChange={handleFitChange}
         onZoomIn={zoomIn}
         onZoomOut={zoomOut}
         onResetZoom={resetZoom}
@@ -729,7 +842,10 @@ export default function ReaderView({ comic, activeShelfId = 0, settings = null, 
           ) : layout === 'vertical' ? (
             <div
               ref={verticalContainerRef}
-              className="w-full h-full overflow-y-auto py-4 px-2 space-y-2 flex flex-col items-center"
+              onScroll={handleVerticalScroll}
+              className={`w-full h-full overflow-y-auto py-4 px-2 flex flex-col items-center ${
+                verticalGap ? 'space-y-2' : 'gap-0'
+              }`}
             >
               {Array.from({ length: pageCount }, (_, idx) => (
                 <VerticalPageSlot

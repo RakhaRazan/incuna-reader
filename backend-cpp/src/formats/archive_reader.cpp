@@ -40,7 +40,21 @@ using detail::read_zip_entry_bytes;
 using detail::win64_read_at;
 
 // Threshold above which solid .7z/.cbr archives progressively spill to disk stream_cache
-constexpr int64_t kSolidStreamCacheThresholdBytes = 1024LL * 1024LL * 1024LL; // 1 GB
+constexpr int64_t kSolidStreamCacheThresholdBytes = 128LL * 1024LL * 1024LL; // 128 MB
+
+std::string la_entry_pathname_utf8(struct archive_entry* entry) {
+    if (!entry) return {};
+    if (const char* u8 = archive_entry_pathname_utf8(entry)) {
+        return std::string(u8);
+    }
+    if (const wchar_t* wp = archive_entry_pathname_w(entry)) {
+        return wide_to_utf8(std::wstring(wp));
+    }
+    if (const char* raw = archive_entry_pathname(entry)) {
+        return std::string(raw);
+    }
+    return {};
+}
 
 std::string resolve_relative_zip_path(const std::string& base_dir, const std::string& href) {
     std::string combined = base_dir.empty() ? href : (base_dir + "/" + href);
@@ -97,8 +111,9 @@ public:
             return open_image_folder_locked(path);
         }
 
+        const std::wstring long_path = to_win32_long_path(path);
         HANDLE h = CreateFileW(
-            path.c_str(),
+            long_path.c_str(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
@@ -577,8 +592,8 @@ private:
         std::vector<std::string> names;
         struct archive_entry* entry = nullptr;
         while (archive_read_next_header(la_cursor_, &entry) == ARCHIVE_OK) {
-            const char* raw_name = archive_entry_pathname(entry);
-            if (raw_name && archive_entry_filetype(entry) != AE_IFDIR) {
+            const std::string raw_name = la_entry_pathname_utf8(entry);
+            if (!raw_name.empty() && archive_entry_filetype(entry) != AE_IFDIR) {
                 std::string norm = normalize_zip_path(raw_name);
                 if (is_supported_image_filename(norm)) {
                     names.push_back(std::move(norm));
@@ -601,9 +616,9 @@ private:
             la_name_to_page_idx_[la_pages_[i]] = static_cast<int>(i);
         }
 
-        // Enable progressive disk stream cache for solid .7z/.cbr archives > 1 GB
+        // Enable progressive disk stream cache for solid .7z/.cbr archives > 128 MB or > 50 pages
         if ((format_ == ComicFormat::Cb7 || format_ == ComicFormat::Cbr) &&
-            file_size_ > kSolidStreamCacheThresholdBytes &&
+            (file_size_ > kSolidStreamCacheThresholdBytes || la_pages_.size() > 50) &&
             !stream_cache_root_.empty()) {
             const size_t h = std::hash<std::wstring>{}(source_path_) ^
                              static_cast<size_t>(GetTickCount64());
@@ -662,8 +677,8 @@ private:
 
             struct archive_entry* entry = nullptr;
             while (archive_read_next_header(la_cursor_, &entry) == ARCHIVE_OK) {
-                const char* raw_name = archive_entry_pathname(entry);
-                if (!raw_name || archive_entry_filetype(entry) == AE_IFDIR) {
+                const std::string raw_name = la_entry_pathname_utf8(entry);
+                if (raw_name.empty() || archive_entry_filetype(entry) == AE_IFDIR) {
                     archive_read_data_skip(la_cursor_);
                     continue;
                 }

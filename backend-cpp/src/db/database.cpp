@@ -17,14 +17,49 @@ namespace {
 constexpr const char* kComicSelectCols =
     "id, path, relative_path, title, format, file_size_bytes, page_count, "
     "current_page, status, is_favorite, is_offline_pinned, offline_path, "
-    "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, COALESCE(is_hidden, 0), "
-    "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, '')";
+    "cover_pack_offset, cover_pack_size, added_at, last_read_at, folder_path, is_hidden, "
+    "COALESCE(series, ''), COALESCE(author, ''), COALESCE(tags, ''), COALESCE(language, ''), "
+    "COALESCE(reading_mode, ''), COALESCE(reading_dir, ''), COALESCE(fit_mode, '')";
 
 constexpr const char* kComicSelectColsAliased =
     "c.id, c.path, c.relative_path, c.title, c.format, c.file_size_bytes, c.page_count, "
     "c.current_page, c.status, c.is_favorite, c.is_offline_pinned, c.offline_path, "
-    "c.cover_pack_offset, c.cover_pack_size, c.added_at, c.last_read_at, c.folder_path, COALESCE(c.is_hidden, 0), "
-    "COALESCE(c.series, ''), COALESCE(c.author, ''), COALESCE(c.tags, ''), COALESCE(c.language, '')";
+    "c.cover_pack_offset, c.cover_pack_size, c.added_at, c.last_read_at, c.folder_path, c.is_hidden, "
+    "COALESCE(c.series, ''), COALESCE(c.author, ''), COALESCE(c.tags, ''), COALESCE(c.language, ''), "
+    "COALESCE(c.reading_mode, ''), COALESCE(c.reading_dir, ''), COALESCE(c.fit_mode, '')";
+
+// Generates a zero-padded natural sort key so "Vol 2" sorts before "Vol 10" directly in SQLite.
+std::string make_natural_sort_key(const std::string& title) {
+    std::string key;
+    key.reserve(title.size() + 24);
+    const size_t n = title.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(title[i]);
+        if (c >= '0' && c <= '9') {
+            const size_t start = i;
+            while (i < n && title[i] >= '0' && title[i] <= '9') ++i;
+            size_t nz = start;
+            while (nz < i && title[nz] == '0') ++nz;
+            const size_t digits = i - nz;
+            if (digits == 0) {
+                key.append(10, '0');
+            } else if (digits < 10) {
+                key.append(10 - digits, '0');
+                key.append(title, nz, digits);
+            } else {
+                key.append(title, nz, digits);
+            }
+        } else if (c >= 'A' && c <= 'Z') {
+            key.push_back(static_cast<char>(c - 'A' + 'a'));
+            ++i;
+        } else {
+            key.push_back(static_cast<char>(c));
+            ++i;
+        }
+    }
+    return key;
+}
 
 struct SqlBindVal {
     bool is_int = false;
@@ -151,6 +186,9 @@ ComicRecord read_comic_row(sqlite3_stmt* stmt) {
     c.author            = col_text(stmt, 19);
     c.tags              = col_text(stmt, 20);
     c.language          = col_text(stmt, 21);
+    c.reading_mode      = col_text(stmt, 22);
+    c.reading_dir       = col_text(stmt, 23);
+    c.fit_mode          = col_text(stmt, 24);
     return c;
 }
 
@@ -199,7 +237,11 @@ Database::~Database() {
 }
 
 bool Database::open(const std::filesystem::path& db_path) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_, read_mutex_);
+    if (read_db_) {
+        sqlite3_close(read_db_);
+        read_db_ = nullptr;
+    }
     if (db_) {
         sqlite3_close(db_);
         db_ = nullptr;
@@ -231,11 +273,29 @@ bool Database::open(const std::filesystem::path& db_path) {
     if (!init_schema()) return false;
     if (!seed_builtin_smartviews()) return false;
 
+    // Dedicated WAL read-only connection so UI queries run concurrently during scanner/pack writes
+    rc = sqlite3_open_v2(
+        utf8_path.c_str(),
+        &read_db_,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+        nullptr);
+    if (rc == SQLITE_OK && read_db_) {
+        sqlite3_busy_timeout(read_db_, 5000);
+        sqlite3_exec(read_db_, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
+    } else if (read_db_) {
+        sqlite3_close(read_db_);
+        read_db_ = nullptr;
+    }
+
     return true;
 }
 
 void Database::close() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_, read_mutex_);
+    if (read_db_) {
+        sqlite3_close(read_db_);
+        read_db_ = nullptr;
+    }
     if (db_) {
         sqlite3_close(db_);
         db_ = nullptr;
@@ -297,7 +357,11 @@ bool Database::init_schema() {
             series            TEXT    NOT NULL DEFAULT '',
             author            TEXT    NOT NULL DEFAULT '',
             tags              TEXT    NOT NULL DEFAULT '',
-            language          TEXT    NOT NULL DEFAULT ''
+            language          TEXT    NOT NULL DEFAULT '',
+            sort_key          TEXT    NOT NULL DEFAULT '',
+            reading_mode      TEXT    NOT NULL DEFAULT '',
+            reading_dir       TEXT    NOT NULL DEFAULT '',
+            fit_mode          TEXT    NOT NULL DEFAULT ''
         );
 
         CREATE INDEX IF NOT EXISTS idx_comics_status          ON comics(status);
@@ -387,54 +451,48 @@ bool Database::init_schema() {
         return false;
     }
 
-    // Migrate existing databases that predate the folder_path column
-    bool has_folder_path = false;
+    // Idempotently migrate existing databases via PRAGMA table_info(comics)
+    std::map<std::string, bool> existing_cols;
     {
         sqlite3_stmt* info_stmt = nullptr;
         if (sqlite3_prepare_v2(db_, "PRAGMA table_info(comics);", -1, &info_stmt, nullptr) == SQLITE_OK) {
             while (sqlite3_step(info_stmt) == SQLITE_ROW) {
-                if (col_text(info_stmt, 1) == "folder_path") {
-                    has_folder_path = true;
-                    break;
-                }
+                existing_cols[col_text(info_stmt, 1)] = true;
             }
             sqlite3_finalize(info_stmt);
         }
     }
-    if (!has_folder_path) {
-        if (!exec_sql("ALTER TABLE comics ADD COLUMN folder_path TEXT NOT NULL DEFAULT '';")) {
-            return false;
-        }
-    }
 
-    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_folder_path ON comics(folder_path);")) {
-        return false;
-    }
-
-    // Safely migrate existing databases to add columns (ignoring duplicate-column errors)
-    auto safe_add_column = [&](const char* alter_sql) -> bool {
-        char* alter_err = nullptr;
-        int alter_rc = sqlite3_exec(db_, alter_sql, nullptr, nullptr, &alter_err);
-        if (alter_rc != SQLITE_OK) {
-            std::string msg = alter_err ? alter_err : "";
-            if (alter_err) sqlite3_free(alter_err);
-            if (msg.find("duplicate column") == std::string::npos) {
-                last_error_ = msg;
-                return false;
-            }
-        }
-        return true;
+    auto ensure_column = [&](const char* col_name, const char* alter_sql) -> bool {
+        if (existing_cols.count(col_name) > 0) return true;
+        return exec_sql(alter_sql);
     };
-    if (!safe_add_column("ALTER TABLE comics ADD COLUMN is_hidden INTEGER DEFAULT 0;")) return false;
-    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_hidden ON comics(is_hidden);")) return false;
-    if (!safe_add_column("ALTER TABLE comics ADD COLUMN series TEXT DEFAULT '';")) return false;
-    if (!safe_add_column("ALTER TABLE comics ADD COLUMN author TEXT DEFAULT '';")) return false;
-    if (!safe_add_column("ALTER TABLE comics ADD COLUMN tags TEXT DEFAULT '';")) return false;
-    if (!safe_add_column("ALTER TABLE comics ADD COLUMN language TEXT DEFAULT '';")) return false;
 
+    if (!ensure_column("folder_path",  "ALTER TABLE comics ADD COLUMN folder_path TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("is_hidden",    "ALTER TABLE comics ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0;")) return false;
+    if (!ensure_column("series",       "ALTER TABLE comics ADD COLUMN series TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("author",       "ALTER TABLE comics ADD COLUMN author TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("tags",         "ALTER TABLE comics ADD COLUMN tags TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("language",     "ALTER TABLE comics ADD COLUMN language TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("sort_key",     "ALTER TABLE comics ADD COLUMN sort_key TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("reading_mode", "ALTER TABLE comics ADD COLUMN reading_mode TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("reading_dir",  "ALTER TABLE comics ADD COLUMN reading_dir TEXT NOT NULL DEFAULT '';")) return false;
+    if (!ensure_column("fit_mode",     "ALTER TABLE comics ADD COLUMN fit_mode TEXT NOT NULL DEFAULT '';")) return false;
+
+    // Backfill any NULL is_hidden rows once so index-friendly `is_hidden = 0` is always exact
+    if (!exec_sql("UPDATE comics SET is_hidden = 0 WHERE is_hidden IS NULL;")) return false;
+
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_folder_path ON comics(folder_path);")) return false;
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_hidden ON comics(is_hidden);")) return false;
     if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_author ON comics(author);")) return false;
     if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_author_nocase ON comics(author COLLATE NOCASE);")) return false;
     if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_series ON comics(series);")) return false;
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_hidden_sort_key ON comics(is_hidden, sort_key, id);")) return false;
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_hidden_title ON comics(is_hidden, title COLLATE NOCASE, id);")) return false;
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_hidden_added ON comics(is_hidden, added_at DESC);")) return false;
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_format ON comics(format);")) return false;
+    if (!exec_sql("DROP INDEX IF EXISTS idx_comics_uncached_cover;")) return false;
+    if (!exec_sql("CREATE INDEX IF NOT EXISTS idx_comics_uncached_cover_path ON comics(path) WHERE cover_pack_size = 0;")) return false;
 
     // Upgrade legacy comics_fts virtual table if it predates author/tags indexing
     bool fts_has_author = false;
@@ -530,6 +588,39 @@ bool Database::init_schema() {
         exec_sql(ok ? "COMMIT;" : "ROLLBACK;");
     }
 
+    // Backfill natural sort_key for any legacy rows once inside a single transaction
+    std::vector<std::pair<int64_t, std::string>> sort_backfill;
+    {
+        sqlite3_stmt* sel = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT id, title FROM comics WHERE sort_key = '' OR sort_key IS NULL;", -1, &sel, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(sel) == SQLITE_ROW) {
+                const int64_t id = sqlite3_column_int64(sel, 0);
+                std::string sk = make_natural_sort_key(col_text(sel, 1));
+                sort_backfill.emplace_back(id, std::move(sk));
+            }
+            sqlite3_finalize(sel);
+        }
+    }
+    if (!sort_backfill.empty() && exec_sql("BEGIN IMMEDIATE;")) {
+        sqlite3_stmt* upd = nullptr;
+        bool ok = false;
+        if (sqlite3_prepare_v2(db_, "UPDATE comics SET sort_key = ?1 WHERE id = ?2;", -1, &upd, nullptr) == SQLITE_OK) {
+            ok = true;
+            for (const auto& [id, sk] : sort_backfill) {
+                sqlite3_reset(upd);
+                sqlite3_clear_bindings(upd);
+                sqlite3_bind_text(upd, 1, sk.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(upd, 2, id);
+                if (sqlite3_step(upd) != SQLITE_DONE) {
+                    ok = false;
+                    break;
+                }
+            }
+            sqlite3_finalize(upd);
+        }
+        exec_sql(ok ? "COMMIT;" : "ROLLBACK;");
+    }
+
     return true;
 }
 
@@ -547,12 +638,13 @@ bool Database::seed_builtin_smartviews() {
 }
 
 int64_t Database::count_comics() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return 0;
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    sqlite3* conn = read_db_ ? read_db_ : db_;
+    if (!conn) return 0;
 
     sqlite3_stmt* stmt = nullptr;
     int64_t total = 0;
-    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM comics;", -1, &stmt, nullptr) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(conn, "SELECT COUNT(*) FROM comics;", -1, &stmt, nullptr) == SQLITE_OK) {
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             total = sqlite3_column_int64(stmt, 0);
         }
@@ -562,12 +654,13 @@ int64_t Database::count_comics() {
 }
 
 bool Database::verify_fts5_available() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return false;
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    sqlite3* conn = read_db_ ? read_db_ : db_;
+    if (!conn) return false;
 
     sqlite3_stmt* stmt = nullptr;
     bool ok = false;
-    if (sqlite3_prepare_v2(db_, "SELECT count(*) FROM comics_fts;", -1, &stmt, nullptr) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(conn, "SELECT count(*) FROM comics_fts;", -1, &stmt, nullptr) == SQLITE_OK) {
         ok = (sqlite3_step(stmt) == SQLITE_ROW);
         sqlite3_finalize(stmt);
     }
@@ -584,8 +677,8 @@ bool Database::upsert_comics_batch(const std::vector<ComicUpsert>& batch) {
     if (!exec_sql("BEGIN IMMEDIATE;")) return false;
 
     static constexpr const char* kSql = R"SQL(
-        INSERT INTO comics (path, relative_path, folder_path, title, format, file_size_bytes, series, author, tags, language)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        INSERT INTO comics (path, relative_path, folder_path, title, format, file_size_bytes, series, author, tags, language, sort_key)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ON CONFLICT(path) DO UPDATE SET
             relative_path   = excluded.relative_path,
             folder_path     = excluded.folder_path,
@@ -595,7 +688,8 @@ bool Database::upsert_comics_batch(const std::vector<ComicUpsert>& batch) {
             series          = CASE WHEN excluded.series != '' THEN excluded.series ELSE comics.series END,
             author          = CASE WHEN excluded.author != '' THEN excluded.author ELSE comics.author END,
             tags            = CASE WHEN excluded.tags != '' THEN excluded.tags ELSE comics.tags END,
-            language        = CASE WHEN excluded.language != '' THEN excluded.language ELSE comics.language END;
+            language        = CASE WHEN excluded.language != '' THEN excluded.language ELSE comics.language END,
+            sort_key        = excluded.sort_key;
     )SQL";
 
     sqlite3_stmt* stmt = nullptr;
@@ -610,6 +704,7 @@ bool Database::upsert_comics_batch(const std::vector<ComicUpsert>& batch) {
         const std::string folder_path = item.folder_path.empty()
             ? derive_folder_path(item.path)
             : item.folder_path;
+        const std::string sort_key = make_natural_sort_key(item.title);
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
         sqlite3_bind_text(stmt, 1, item.path.c_str(), -1, SQLITE_TRANSIENT);
@@ -622,6 +717,7 @@ bool Database::upsert_comics_batch(const std::vector<ComicUpsert>& batch) {
         sqlite3_bind_text(stmt, 8, item.author.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 9, item.tags.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 10, item.language.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 11, sort_key.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt) != SQLITE_DONE) {
             last_error_ = sqlite3_errmsg(db_);
             ok = false;
@@ -663,8 +759,9 @@ bool Database::rename_comic_path(const std::string& old_path,
     if (!db_) return false;
 
     const std::string new_folder_path = derive_folder_path(new_path);
+    const std::string new_sort_key = make_natural_sort_key(new_title);
     static constexpr const char* kSql =
-        "UPDATE comics SET path = ?1, folder_path = ?2, title = ?3 WHERE path = ?4;";
+        "UPDATE comics SET path = ?1, folder_path = ?2, title = ?3, sort_key = ?4 WHERE path = ?5;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, kSql, -1, &stmt, nullptr) != SQLITE_OK) {
         last_error_ = sqlite3_errmsg(db_);
@@ -673,7 +770,8 @@ bool Database::rename_comic_path(const std::string& old_path,
     sqlite3_bind_text(stmt, 1, new_path.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, new_folder_path.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 3, new_title.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, old_path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, new_sort_key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, old_path.c_str(), -1, SQLITE_TRANSIENT);
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(db_) > 0);
     if (!ok) last_error_ = sqlite3_errmsg(db_);
     sqlite3_finalize(stmt);
@@ -681,12 +779,13 @@ bool Database::rename_comic_path(const std::string& old_path,
 }
 
 bool Database::get_comic(int64_t id, ComicRecord& out) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return false;
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    sqlite3* conn = read_db_ ? read_db_ : db_;
+    if (!conn) return false;
 
     const std::string sql = std::string("SELECT ") + kComicSelectCols + " FROM comics WHERE id = ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_int64(stmt, 1, id);
     bool found = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -732,12 +831,13 @@ std::vector<ComicRecord> Database::get_adjacent_candidates(int64_t shelf_id, con
 }
 
 bool Database::get_comic_by_path(const std::string& path, ComicRecord& out) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return false;
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    sqlite3* conn = read_db_ ? read_db_ : db_;
+    if (!conn) return false;
 
     const std::string sql = std::string("SELECT ") + kComicSelectCols + " FROM comics WHERE path = ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
     bool found = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -749,15 +849,16 @@ bool Database::get_comic_by_path(const std::string& path, ComicRecord& out) {
 }
 
 std::vector<ComicRecord> Database::get_recent_comics(int limit) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(read_mutex_);
     std::vector<ComicRecord> results;
-    if (!db_ || limit <= 0) return results;
+    sqlite3* conn = read_db_ ? read_db_ : db_;
+    if (!conn || limit <= 0) return results;
 
     const std::string sql =
         std::string("SELECT ") + kComicSelectCols +
         " FROM comics WHERE last_read_at > 0 ORDER BY last_read_at DESC, id DESC LIMIT ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
     sqlite3_bind_int(stmt, 1, limit);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         results.push_back(read_comic_row(stmt));
@@ -767,17 +868,18 @@ std::vector<ComicRecord> Database::get_recent_comics(int limit) {
 }
 
 std::vector<ComicRecord> Database::get_continue_reading(int limit, bool include_hidden) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(read_mutex_);
     std::vector<ComicRecord> results;
-    if (!db_ || limit <= 0) return results;
+    sqlite3* conn = read_db_ ? read_db_ : db_;
+    if (!conn || limit <= 0) return results;
 
     const std::string sql =
         std::string("SELECT ") + kComicSelectCols +
         " FROM comics WHERE last_read_at > 0 AND status IN ('reading', 'read') "
-        "AND (?2 = 1 OR COALESCE(is_hidden, 0) = 0) "
+        "AND (?2 = 1 OR is_hidden = 0) "
         "ORDER BY last_read_at DESC, id DESC LIMIT ?1;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
     sqlite3_bind_int(stmt, 1, std::clamp(limit, 1, 100));
     sqlite3_bind_int(stmt, 2, include_hidden ? 1 : 0);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -804,7 +906,7 @@ bool Database::get_random_unread_comic(const RandomComicQuery& q, ComicRecord& o
 
     conds.push_back("c.status = 'unread'");
     if (!q.include_hidden) {
-        conds.push_back("COALESCE(c.is_hidden, 0) = 0");
+        conds.push_back("c.is_hidden = 0");
     }
     if (q.shelf_id > 0) {
         conds.push_back("cs.shelf_id = ?");
@@ -917,12 +1019,13 @@ int64_t Database::count_unindexed_covers() {
 }
 
 LibraryPageResult Database::query_library(const LibraryQuery& q) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(read_mutex_);
     LibraryPageResult res;
-    if (!db_) return res;
+    sqlite3* conn = read_db_ ? read_db_ : db_;
+    if (!conn) return res;
 
     // Resolve optional smartview JSON filter (by smartview_id or slug)
-    const nlohmann::json sv_filter = load_smartview_filter(db_, q.smartview_id, q.smartview);
+    const nlohmann::json sv_filter = load_smartview_filter(conn, q.smartview_id, q.smartview);
 
     std::string fts_expr = build_safe_fts5_query(q.search);
 
@@ -939,7 +1042,7 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
     std::vector<SqlBindVal> binds;
 
     if (!q.include_hidden) {
-        conds.push_back("COALESCE(c.is_hidden, 0) = 0");
+        conds.push_back("c.is_hidden = 0");
     }
     if (!fts_expr.empty()) {
         conds.push_back("comics_fts MATCH ?");
@@ -1019,21 +1122,20 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
     {
         const std::string count_sql = "SELECT COUNT(*)" + from_where.str() + ";";
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, count_sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(conn, count_sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
             bind_sql_params(stmt, binds);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
                 res.total_count = sqlite3_column_int64(stmt, 0);
             }
             sqlite3_finalize(stmt);
         } else {
-            last_error_ = sqlite3_errmsg(db_);
             return res;
         }
     }
 
     // 2. Paginated/windowed slice
-    std::string order_by = " ORDER BY c.title COLLATE NOCASE ASC, c.id ASC ";
-    if (q.sort == "title_desc")          order_by = " ORDER BY c.title COLLATE NOCASE DESC, c.id DESC ";
+    std::string order_by = " ORDER BY c.sort_key ASC, c.id ASC ";
+    if (q.sort == "title_desc")          order_by = " ORDER BY c.sort_key DESC, c.id DESC ";
     else if (q.sort == "added_desc")     order_by = " ORDER BY c.added_at DESC, c.id DESC ";
     else if (q.sort == "last_read_desc") order_by = " ORDER BY c.last_read_at DESC, c.id DESC ";
     else if (q.sort == "size_desc")      order_by = " ORDER BY c.file_size_bytes DESC, c.id ASC ";
@@ -1043,7 +1145,7 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
         from_where.str() + order_by + " LIMIT ? OFFSET ?;";
 
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, select_sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(conn, select_sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
         bind_sql_params(stmt, binds);
         const int base = static_cast<int>(binds.size());
         sqlite3_bind_int(stmt, base + 1, safe_limit);
@@ -1052,8 +1154,6 @@ LibraryPageResult Database::query_library(const LibraryQuery& q) {
             res.items.push_back(read_comic_row(stmt));
         }
         sqlite3_finalize(stmt);
-    } else {
-        last_error_ = sqlite3_errmsg(db_);
     }
 
     return res;
@@ -1087,6 +1187,31 @@ bool Database::update_comic_progress(int64_t id,
     sqlite3_bind_text(stmt, 3, status.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 4, is_favorite_opt);
     sqlite3_bind_int64(stmt, 5, id);
+
+    const bool ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(db_) > 0);
+    if (!ok) last_error_ = sqlite3_errmsg(db_);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool Database::update_comic_reading_profile(int64_t id,
+                                            const std::string& mode,
+                                            const std::string& dir,
+                                            const std::string& fit) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_ || id <= 0) return false;
+
+    static constexpr const char* kSql =
+        "UPDATE comics SET reading_mode = ?1, reading_dir = ?2, fit_mode = ?3 WHERE id = ?4;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSql, -1, &stmt, nullptr) != SQLITE_OK) {
+        last_error_ = sqlite3_errmsg(db_);
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, mode.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, fit.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, id);
 
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(db_) > 0);
     if (!ok) last_error_ = sqlite3_errmsg(db_);
@@ -1776,7 +1901,7 @@ std::vector<LibraryFolderEntry> Database::get_library_folders(const std::string&
     {
         const char* sql = include_hidden
             ? "SELECT folder_path, COUNT(*), MIN(id) FROM comics WHERE folder_path != '' GROUP BY folder_path;"
-            : "SELECT folder_path, COUNT(*), MIN(id) FROM comics WHERE folder_path != '' AND COALESCE(is_hidden, 0) = 0 GROUP BY folder_path;";
+            : "SELECT folder_path, COUNT(*), MIN(id) FROM comics WHERE folder_path != '' AND is_hidden = 0 GROUP BY folder_path;";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
             last_error_ = sqlite3_errmsg(db_);

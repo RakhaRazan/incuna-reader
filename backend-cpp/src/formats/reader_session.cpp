@@ -37,7 +37,7 @@ bool ReaderSession::open(const std::wstring& path) {
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        reader_ = std::move(new_reader);
+        reader_ = std::shared_ptr<ComicReader>(std::move(new_reader));
         current_path_ = path;
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -75,14 +75,15 @@ void ReaderSession::close() {
         prefetch_center_ = -1;
     }
 
+    std::shared_ptr<ComicReader> old_reader;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (reader_) {
-            reader_->close();
-            reader_.reset();
-        }
+        old_reader = std::move(reader_);
         current_path_.clear();
         session_id_.clear();
+    }
+    if (old_reader) {
+        old_reader->close();
     }
 }
 
@@ -140,12 +141,12 @@ void ReaderSession::evict_outside_window_locked(int center_page) {
 }
 
 RenderedPage ReaderSession::get_page(int index, int target_width, bool auto_crop) {
-    ComicReader* raw_reader = nullptr;
+    std::shared_ptr<ComicReader> local_reader;
     int total_pages = 0;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (!reader_ || !reader_->is_open()) return {};
-        raw_reader = reader_.get();
+        local_reader = reader_;
         total_pages = reader_->page_count();
     }
 
@@ -188,7 +189,7 @@ RenderedPage ReaderSession::get_page(int index, int target_width, bool auto_crop
         }
     } fg_guard{active_foreground_requests_, worker_cv_};
 
-    RenderedPage rendered = raw_reader->render_page(index, target_width, auto_crop);
+    RenderedPage rendered = local_reader->render_page(index, target_width, auto_crop);
     if (!rendered.valid()) {
         return {};
     }
@@ -214,9 +215,13 @@ RenderedPage ReaderSession::get_page(int index, int target_width, bool auto_crop
 }
 
 RenderedPage ReaderSession::extract_cover(int max_w, int max_h) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    if (!reader_ || !reader_->is_open()) return {};
-    return reader_->extract_cover(max_w, max_h);
+    std::shared_ptr<ComicReader> local_reader;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!reader_ || !reader_->is_open()) return {};
+        local_reader = reader_;
+    }
+    return local_reader->extract_cover(max_w, max_h);
 }
 
 void ReaderSession::worker_loop() {
@@ -249,12 +254,12 @@ void ReaderSession::worker_loop() {
             last_handled_gen = gen;
         }
 
-        ComicReader* raw_reader = nullptr;
+        std::shared_ptr<ComicReader> local_reader;
         int total_pages = 0;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             if (!reader_ || !reader_->is_open()) continue;
-            raw_reader = reader_.get();
+            local_reader = reader_;
             total_pages = reader_->page_count();
         }
 
@@ -284,7 +289,7 @@ void ReaderSession::worker_loop() {
                 }
             }
 
-            RenderedPage prefetched = raw_reader->render_page(candidate, target_w, auto_crop);
+            RenderedPage prefetched = local_reader->render_page(candidate, target_w, auto_crop);
             if (!prefetched.valid()) continue;
 
             std::lock_guard<std::mutex> clock(cache_mutex_);

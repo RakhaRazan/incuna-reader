@@ -1,4 +1,4 @@
 {
-    "cmake.sourceDirectory": "C:/FILE PROYEKAN/KomaReader/backend-cpp",
-    "css.lint.unknownAtRules": "ignore"
+  "cmake.sourceDirectory": "C:/FILE PROYEKAN/IncunaReader/backend-cpp",
+  "css.lint.unknownAtRules": "ignore"
 }

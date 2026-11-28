@@ -136,6 +136,8 @@ private:
     bool wsa_initialized_ = false;
 
     mutable std::mutex token_mutex_;
+    std::mutex gdrive_refresh_mutex_;
+    std::mutex onedrive_refresh_mutex_;
     std::unordered_map<std::string, ProviderToken> tokens_;
 
     // Background OAuth2 loopback listener state

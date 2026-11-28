@@ -9,6 +9,8 @@
 #include <winhttp.h>
 #include <shellapi.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
+#include <dpapi.h>
 
 #include <algorithm>
 #include <array>
@@ -262,7 +264,7 @@ HttpResponse winhttp_request(const std::wstring& method,
         return resp;
     }
 
-    ScopedWinHttp session(WinHttpOpen(L"IncunaReader/0.1.0",
+    ScopedWinHttp session(WinHttpOpen(L"IncunaReader/1.1.0",
                                       WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                       WINHTTP_NO_PROXY_NAME,
                                       WINHTTP_NO_PROXY_BYPASS, 0));
@@ -352,7 +354,7 @@ bool winhttp_download_to_file(const std::string& url_utf8,
         return false;
     }
 
-    ScopedWinHttp session(WinHttpOpen(L"IncunaReader/0.1.0",
+    ScopedWinHttp session(WinHttpOpen(L"IncunaReader/1.1.0",
                                       WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                       WINHTTP_NO_PROXY_NAME,
                                       WINHTTP_NO_PROXY_BYPASS, 0));
@@ -489,6 +491,64 @@ std::string extract_oauth_error_message(const HttpResponse& resp) {
     return "HTTP " + std::to_string(resp.status_code);
 }
 
+bool dpapi_encrypt_to_base64(const std::string& plaintext, std::string& out_b64) {
+    out_b64.clear();
+    DATA_BLOB in_blob{};
+    in_blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plaintext.data()));
+    in_blob.cbData = static_cast<DWORD>(plaintext.size());
+
+    DATA_BLOB out_blob{};
+    if (!CryptProtectData(&in_blob, L"IncunaReaderCloudTokens", nullptr, nullptr, nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN, &out_blob)) {
+        return false;
+    }
+
+    DWORD b64_len = 0;
+    bool ok = false;
+    if (CryptBinaryToStringA(out_blob.pbData, out_blob.cbData,
+                             CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                             nullptr, &b64_len) && b64_len > 0) {
+        std::string buf(b64_len, '\0');
+        if (CryptBinaryToStringA(out_blob.pbData, out_blob.cbData,
+                                 CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                                 buf.data(), &b64_len)) {
+            while (!buf.empty() && buf.back() == '\0') buf.pop_back();
+            out_b64 = std::move(buf);
+            ok = true;
+        }
+    }
+    LocalFree(out_blob.pbData);
+    return ok;
+}
+
+bool dpapi_decrypt_from_base64(const std::string& b64, std::string& out_plaintext) {
+    out_plaintext.clear();
+    DWORD bin_len = 0;
+    if (!CryptStringToBinaryA(b64.c_str(), static_cast<DWORD>(b64.size()),
+                              CRYPT_STRING_BASE64, nullptr, &bin_len, nullptr, nullptr) || bin_len == 0) {
+        return false;
+    }
+    std::vector<BYTE> bin(bin_len);
+    if (!CryptStringToBinaryA(b64.c_str(), static_cast<DWORD>(b64.size()),
+                              CRYPT_STRING_BASE64, bin.data(), &bin_len, nullptr, nullptr)) {
+        return false;
+    }
+
+    DATA_BLOB in_blob{};
+    in_blob.pbData = bin.data();
+    in_blob.cbData = bin_len;
+
+    DATA_BLOB out_blob{};
+    if (!CryptUnprotectData(&in_blob, nullptr, nullptr, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &out_blob)) {
+        return false;
+    }
+    out_plaintext.assign(reinterpret_cast<const char*>(out_blob.pbData), out_blob.cbData);
+    SecureZeroMemory(out_blob.pbData, out_blob.cbData);
+    LocalFree(out_blob.pbData);
+    return true;
+}
+
 } // namespace
 
 // ============================================================================
@@ -556,6 +616,18 @@ void CloudClient::load_tokens() {
         ifs >> j;
         if (!j.is_object()) return;
 
+        bool migrated_from_plaintext = false;
+        if (j.contains("dpapi") && j["dpapi"].is_string()) {
+            std::string decrypted;
+            if (!dpapi_decrypt_from_base64(j["dpapi"].get<std::string>(), decrypted)) {
+                return;
+            }
+            j = nlohmann::json::parse(decrypted);
+            if (!j.is_object()) return;
+        } else if (j.contains("gdrive") || j.contains("onedrive")) {
+            migrated_from_plaintext = true;
+        }
+
         for (const char* prov : {"gdrive", "onedrive"}) {
             if (!j.contains(prov) || !j[prov].is_object()) continue;
             const auto& obj = j[prov];
@@ -568,6 +640,11 @@ void CloudClient::load_tokens() {
             if (!t.access_token.empty() || !t.refresh_token.empty()) {
                 tokens_[prov] = std::move(t);
             }
+        }
+
+        // Transparent one-time migration of legacy v1.0.0 plaintext cloud_tokens.json to DPAPI
+        if (migrated_from_plaintext && !tokens_.empty()) {
+            save_tokens_locked();
         }
     } catch (...) {
         // Ignore corrupt token file
@@ -591,12 +668,19 @@ bool CloudClient::save_tokens_locked() const {
         };
     }
 
+    const std::string plaintext = root.dump();
+    std::string encrypted_b64;
+    if (!dpapi_encrypt_to_base64(plaintext, encrypted_b64)) {
+        return false;
+    }
+    const nlohmann::json envelope{{"dpapi", encrypted_b64}};
+
     std::filesystem::path tmp_path = tokens_path_;
     tmp_path += L".tmp";
     {
         std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
         if (!ofs.is_open()) return false;
-        ofs << root.dump(2) << "\n";
+        ofs << envelope.dump(2) << "\n";
         ofs.flush();
         if (!ofs.good()) return false;
     }
@@ -882,6 +966,25 @@ bool CloudClient::exchange_auth_code(const std::string& provider,
 bool CloudClient::ensure_valid_access_token(const std::string& provider,
                                             std::string& out_token,
                                             std::string& out_error) {
+    {
+        std::lock_guard<std::mutex> lock(token_mutex_);
+        auto it = tokens_.find(provider);
+        if (it == tokens_.end() || (it->second.access_token.empty() && it->second.refresh_token.empty())) {
+            out_error = "Provider '" + provider + "' is not connected";
+            return false;
+        }
+        const int64_t now = unix_now_seconds();
+        if (!it->second.access_token.empty() && (it->second.expires_at == 0 || now + 60 < it->second.expires_at)) {
+            out_token = it->second.access_token;
+            return true;
+        }
+    }
+
+    // Per-provider refresh serialization with double-checked locking so concurrent
+    // requests never double-refresh and invalidate rotating OneDrive refresh tokens.
+    std::mutex& refresh_mtx = (provider == "gdrive") ? gdrive_refresh_mutex_ : onedrive_refresh_mutex_;
+    std::lock_guard<std::mutex> refresh_lock(refresh_mtx);
+
     ProviderToken copy;
     {
         std::lock_guard<std::mutex> lock(token_mutex_);
@@ -890,13 +993,12 @@ bool CloudClient::ensure_valid_access_token(const std::string& provider,
             out_error = "Provider '" + provider + "' is not connected";
             return false;
         }
+        const int64_t now = unix_now_seconds();
+        if (!it->second.access_token.empty() && (it->second.expires_at == 0 || now + 60 < it->second.expires_at)) {
+            out_token = it->second.access_token;
+            return true;
+        }
         copy = it->second;
-    }
-
-    const int64_t now = unix_now_seconds();
-    if (!copy.access_token.empty() && (copy.expires_at == 0 || now + 60 < copy.expires_at)) {
-        out_token = copy.access_token;
-        return true;
     }
 
     if (copy.refresh_token.empty()) {
@@ -1034,6 +1136,9 @@ CloudListResult CloudClient::list_folder(const std::string& provider, const std:
 
     const std::wstring auth_hdr = L"Authorization: Bearer " + utf8_to_wide(access_token) + L"\r\n";
 
+    constexpr int kMaxPages = 50;
+    constexpr size_t kMaxItems = 10000;
+
     if (provider == "gdrive") {
         const std::string parent = folder_id.empty() ? "root" : folder_id;
         std::string escaped_parent;
@@ -1043,58 +1148,71 @@ CloudListResult CloudClient::list_folder(const std::string& provider, const std:
             escaped_parent.push_back(ch);
         }
         const std::string q = "'" + escaped_parent + "' in parents and trashed = false";
-        const std::string url =
+        const std::string base_url =
             "https://www.googleapis.com/drive/v3/files"
             "?q=" + url_encode(q) +
-            "&fields=" + url_encode("files(id,name,mimeType,size,modifiedTime)") +
+            "&fields=" + url_encode("nextPageToken,files(id,name,mimeType,size,modifiedTime)") +
             "&pageSize=200"
             "&orderBy=" + url_encode("folder,name");
 
-        HttpResponse resp = winhttp_request(L"GET", url, {auth_hdr}, "");
-        if (resp.status_code < 200 || resp.status_code >= 300) {
-            res.http_status = resp.status_code > 0 ? resp.status_code : 502;
-            res.error = "Google Drive list failed: " + extract_oauth_error_message(resp);
-            return res;
-        }
+        std::string page_token;
+        for (int page = 0; page < kMaxPages && res.items.size() < kMaxItems; ++page) {
+            const std::string url = page_token.empty()
+                ? base_url
+                : (base_url + "&pageToken=" + url_encode(page_token));
 
-        try {
-            auto j = nlohmann::json::parse(resp.body);
-            if (j.contains("files") && j["files"].is_array()) {
-                for (const auto& f : j["files"]) {
-                    const std::string id = f.value("id", "");
-                    const std::string name = f.value("name", "");
-                    const std::string mime = f.value("mimeType", "");
-                    if (id.empty() || name.empty()) continue;
-
-                    const bool is_folder = (mime == "application/vnd.google-apps.folder");
-                    std::string format;
-                    if (!is_folder && !extract_comic_format(name, format)) {
-                        continue;
-                    }
-
-                    int64_t sz = 0;
-                    if (f.contains("size")) {
-                        if (f["size"].is_string()) {
-                            try { sz = std::stoll(f["size"].get<std::string>()); } catch (...) {}
-                        } else if (f["size"].is_number_integer()) {
-                            sz = f["size"].get<int64_t>();
-                        }
-                    }
-
-                    CloudFileEntry entry;
-                    entry.id = id;
-                    entry.name = name;
-                    entry.is_folder = is_folder;
-                    entry.size = sz;
-                    entry.format = format;
-                    entry.modified_at = f.value("modifiedTime", "");
-                    res.items.push_back(std::move(entry));
-                }
+            HttpResponse resp = winhttp_request(L"GET", url, {auth_hdr}, "");
+            if (resp.status_code < 200 || resp.status_code >= 300) {
+                res.http_status = resp.status_code > 0 ? resp.status_code : 502;
+                res.error = "Google Drive list failed: " + extract_oauth_error_message(resp);
+                res.ok = false;
+                return res;
             }
-            res.ok = true;
-        } catch (const std::exception& ex) {
-            res.http_status = 502;
-            res.error = std::string("Failed to parse Google Drive response: ") + ex.what();
+
+            try {
+                auto j = nlohmann::json::parse(resp.body);
+                if (j.contains("files") && j["files"].is_array()) {
+                    for (const auto& f : j["files"]) {
+                        if (res.items.size() >= kMaxItems) break;
+                        const std::string id = f.value("id", "");
+                        const std::string name = f.value("name", "");
+                        const std::string mime = f.value("mimeType", "");
+                        if (id.empty() || name.empty()) continue;
+
+                        const bool is_folder = (mime == "application/vnd.google-apps.folder");
+                        std::string format;
+                        if (!is_folder && !extract_comic_format(name, format)) {
+                            continue;
+                        }
+
+                        int64_t sz = 0;
+                        if (f.contains("size")) {
+                            if (f["size"].is_string()) {
+                                try { sz = std::stoll(f["size"].get<std::string>()); } catch (...) {}
+                            } else if (f["size"].is_number_integer()) {
+                                sz = f["size"].get<int64_t>();
+                            }
+                        }
+
+                        CloudFileEntry entry;
+                        entry.id = id;
+                        entry.name = name;
+                        entry.is_folder = is_folder;
+                        entry.size = sz;
+                        entry.format = format;
+                        entry.modified_at = f.value("modifiedTime", "");
+                        res.items.push_back(std::move(entry));
+                    }
+                }
+                page_token = j.value("nextPageToken", "");
+                res.ok = true;
+                if (page_token.empty()) break;
+            } catch (const std::exception& ex) {
+                res.http_status = 502;
+                res.error = std::string("Failed to parse Google Drive response: ") + ex.what();
+                res.ok = false;
+                return res;
+            }
         }
     } else {
         std::string url;
@@ -1106,41 +1224,48 @@ CloudListResult CloudClient::list_folder(const std::string& provider, const std:
                   "/children?$select=id,name,size,folder,file,lastModifiedDateTime&$top=200";
         }
 
-        HttpResponse resp = winhttp_request(L"GET", url, {auth_hdr}, "");
-        if (resp.status_code < 200 || resp.status_code >= 300) {
-            res.http_status = resp.status_code > 0 ? resp.status_code : 502;
-            res.error = "OneDrive list failed: " + extract_oauth_error_message(resp);
-            return res;
-        }
-
-        try {
-            auto j = nlohmann::json::parse(resp.body);
-            if (j.contains("value") && j["value"].is_array()) {
-                for (const auto& f : j["value"]) {
-                    const std::string id = f.value("id", "");
-                    const std::string name = f.value("name", "");
-                    if (id.empty() || name.empty()) continue;
-
-                    const bool is_folder = f.contains("folder") && f["folder"].is_object();
-                    std::string format;
-                    if (!is_folder && !extract_comic_format(name, format)) {
-                        continue;
-                    }
-
-                    CloudFileEntry entry;
-                    entry.id = id;
-                    entry.name = name;
-                    entry.is_folder = is_folder;
-                    entry.size = f.value("size", int64_t{0});
-                    entry.format = format;
-                    entry.modified_at = f.value("lastModifiedDateTime", "");
-                    res.items.push_back(std::move(entry));
-                }
+        for (int page = 0; page < kMaxPages && !url.empty() && res.items.size() < kMaxItems; ++page) {
+            HttpResponse resp = winhttp_request(L"GET", url, {auth_hdr}, "");
+            if (resp.status_code < 200 || resp.status_code >= 300) {
+                res.http_status = resp.status_code > 0 ? resp.status_code : 502;
+                res.error = "OneDrive list failed: " + extract_oauth_error_message(resp);
+                res.ok = false;
+                return res;
             }
-            res.ok = true;
-        } catch (const std::exception& ex) {
-            res.http_status = 502;
-            res.error = std::string("Failed to parse OneDrive response: ") + ex.what();
+
+            try {
+                auto j = nlohmann::json::parse(resp.body);
+                if (j.contains("value") && j["value"].is_array()) {
+                    for (const auto& f : j["value"]) {
+                        if (res.items.size() >= kMaxItems) break;
+                        const std::string id = f.value("id", "");
+                        const std::string name = f.value("name", "");
+                        if (id.empty() || name.empty()) continue;
+
+                        const bool is_folder = f.contains("folder") && f["folder"].is_object();
+                        std::string format;
+                        if (!is_folder && !extract_comic_format(name, format)) {
+                            continue;
+                        }
+
+                        CloudFileEntry entry;
+                        entry.id = id;
+                        entry.name = name;
+                        entry.is_folder = is_folder;
+                        entry.size = f.value("size", int64_t{0});
+                        entry.format = format;
+                        entry.modified_at = f.value("lastModifiedDateTime", "");
+                        res.items.push_back(std::move(entry));
+                    }
+                }
+                url = j.value("@odata.nextLink", "");
+                res.ok = true;
+            } catch (const std::exception& ex) {
+                res.http_status = 502;
+                res.error = std::string("Failed to parse OneDrive response: ") + ex.what();
+                res.ok = false;
+                return res;
+            }
         }
     }
 

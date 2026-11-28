@@ -4,7 +4,10 @@ import en from './locales/en.json';
 import id from './locales/id.json';
 import ja from './locales/ja.json';
 
-const savedLang = typeof window !== 'undefined' ? localStorage.getItem('koma_lang') : null;
+const savedLang =
+  typeof window !== 'undefined'
+    ? localStorage.getItem('incuna_lang') || localStorage.getItem('koma_lang')
+    : null;
 
 i18n.use(initReactI18next).init({
   resources: {

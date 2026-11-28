@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from './api/client';
 import { useLibraryState } from './hooks/useLibraryState';
@@ -23,6 +23,25 @@ export default function App() {
   const [cloudImportProvider, setCloudImportProvider] = useState(null);
   const [contextMenu, setContextMenu] = useState(null);
   const [randomBusy, setRandomBusy] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  const openDroppedPath = (filePath) => {
+    if (!filePath) return;
+    const filename = filePath.split(/[\\/]/).pop() || filePath;
+    lib.setActiveComic({ id: 0, path: filePath, title: filename, current_page: 0 });
+  };
+
+  useEffect(() => {
+    const onNativeDrop = (e) => {
+      setIsDragOver(false);
+      const droppedPath = e?.detail?.path;
+      if (droppedPath) {
+        openDroppedPath(droppedPath);
+      }
+    };
+    window.addEventListener('incuna-file-drop', onNativeDrop);
+    return () => window.removeEventListener('incuna-file-drop', onNativeDrop);
+  }, []);
 
   useLibraryShortcuts({
     enabled: !lib.activeComic,
@@ -63,8 +82,36 @@ export default function App() {
     }
   };
 
+  const handleDropFile = (e) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const file = e.dataTransfer?.files?.[0];
+    let filePath = file?.path || '';
+    if (!filePath) {
+      const uri = e.dataTransfer?.getData('text/uri-list') || e.dataTransfer?.getData('text/plain') || '';
+      if (uri.startsWith('file:///')) {
+        filePath = decodeURIComponent(uri.slice(8)).replace(/\//g, '\\');
+      }
+    }
+    if (filePath) {
+      openDroppedPath(filePath);
+    }
+  };
+
   return (
-    <div className="h-screen w-screen flex overflow-hidden bg-[#F4F6F9] dark:bg-[#0B0D10] text-slate-900 dark:text-[#F1F5F9]">
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        if (!isDragOver) setIsDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setIsDragOver(false);
+      }}
+      onDrop={handleDropFile}
+      className={`h-screen w-screen flex overflow-hidden bg-[#F4F6F9] dark:bg-[#0B0D10] text-slate-900 dark:text-[#F1F5F9] ${
+        isDragOver ? 'ring-2 ring-inset ring-cyan-500 dark:ring-[#22D3EE]' : ''
+      }`}
+    >
       <SidebarNav
         allComicsCount={lib.allComicsCount}
         activeFilter={lib.activeFilter}
@@ -213,6 +260,7 @@ export default function App() {
         onToggleHidden={lib.handleToggleHidden}
         onAssignShelf={lib.handleAssignShelf}
         onRemoveFromShelf={lib.handleRemoveFromShelf}
+        onDeleteComic={lib.handleDeleteComic}
         onFilterAuthor={(author) => lib.setAuthorFilter(author)}
         onFilterTag={(tag) => lib.setTagFilter(tag)}
       />

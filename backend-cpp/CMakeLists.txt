@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(IncunaReader VERSION 0.1.0 LANGUAGES C CXX)
+project(IncunaReader VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -292,6 +292,7 @@ target_link_libraries(koma_core PUBLIC
     user32
     winhttp
     bcrypt
+    crypt32
     ws2_32
 )
 

@@ -66,7 +66,7 @@ void register_reader_routes(httplib::Server& server, ReaderRouteContext ctx) {
     server.Get("/api/health", guarded([ctx](const httplib::Request&, httplib::Response& res) {
         nlohmann::json body{
             {"status", ctx.db_ok ? "ok" : "degraded"},
-            {"version", "0.1.0"},
+            {"version", "1.1.0"},
             {"portable_root", ctx.paths.exe_dir_utf8()},
             {"db_path", ctx.paths.library_db_utf8()},
             {"db_open", ctx.db.is_open()},

@@ -71,6 +71,15 @@ LibraryScanner::~LibraryScanner() {
     if (scan_thread_.joinable()) {
         scan_thread_.join();
     }
+    {
+        std::lock_guard<std::mutex> lock(meta_queue_mutex_);
+        stop_meta_worker_ = true;
+        meta_queue_.clear();
+    }
+    meta_queue_cv_.notify_all();
+    if (meta_thread_.joinable()) {
+        meta_thread_.join();
+    }
     stop_all_watchers();
 }
 
@@ -301,6 +310,10 @@ void LibraryScanner::process_scan_job(const ScanJob& job) {
 
     std::vector<ComicUpsert> batch;
     batch.reserve(kBatchSize);
+    std::vector<MetadataJob> deferred_meta;
+    if (extract_metadata) {
+        deferred_meta.reserve(kBatchSize);
+    }
     std::unordered_set<std::string> seen_paths_lower;
 
     std::error_code ec;
@@ -335,8 +348,15 @@ void LibraryScanner::process_scan_job(const ScanJob& job) {
         item.title = wide_to_utf8(p.stem().wstring());
         item.format = std::move(fmt);
         item.file_size_bytes = static_cast<int64_t>(entry.file_size(rel_ec));
+
         if (extract_metadata) {
-            populate_comic_metadata(p, item.format, item.title, item);
+            // Fast 0-I/O filename metadata during initial discovery; defer archive/PDF
+            // inspection to low-priority background worker after rows are committed.
+            ComicMetadata fast_meta;
+            parse_filename_metadata(item.title, fast_meta);
+            item.author = std::move(fast_meta.author);
+            item.tags   = std::move(fast_meta.tags);
+            deferred_meta.push_back(MetadataJob{p, item});
         }
 
         batch.push_back(std::move(item));
@@ -353,6 +373,9 @@ void LibraryScanner::process_scan_job(const ScanJob& job) {
                 ++status_.batches_committed;
             }
             batch.clear();
+            if (!deferred_meta.empty()) {
+                enqueue_metadata_jobs(deferred_meta);
+            }
         }
     }
 
@@ -364,6 +387,9 @@ void LibraryScanner::process_scan_job(const ScanJob& job) {
         }
         batch.clear();
     }
+    if (!deferred_meta.empty() && !cancel_scan_.load()) {
+        enqueue_metadata_jobs(deferred_meta);
+    }
 
     if (!cancel_scan_.load() && is_folder_online(root_folder)) {
         prune_orphans_for_folder(root_folder, &seen_paths_lower);
@@ -371,6 +397,77 @@ void LibraryScanner::process_scan_job(const ScanJob& job) {
 
     if (folder_id > 0) {
         db_.update_watched_folder_scanned(folder_id);
+    }
+}
+
+void LibraryScanner::enqueue_metadata_jobs(std::vector<MetadataJob>& jobs) {
+    if (jobs.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(meta_queue_mutex_);
+        if (stop_meta_worker_) {
+            jobs.clear();
+            return;
+        }
+        for (auto& j : jobs) {
+            meta_queue_.push_back(std::move(j));
+        }
+        jobs.clear();
+        if (!meta_thread_.joinable()) {
+            meta_thread_ = std::thread(&LibraryScanner::metadata_worker_loop, this);
+        }
+    }
+    meta_queue_cv_.notify_one();
+}
+
+void LibraryScanner::metadata_worker_loop() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+    std::vector<ComicUpsert> flush_batch;
+    flush_batch.reserve(64);
+
+    while (true) {
+        MetadataJob job;
+        {
+            std::unique_lock<std::mutex> lock(meta_queue_mutex_);
+            if (meta_queue_.empty() && !flush_batch.empty()) {
+                lock.unlock();
+                db_.upsert_comics_batch(flush_batch);
+                flush_batch.clear();
+                lock.lock();
+            }
+            meta_queue_cv_.wait(lock, [this]() {
+                return stop_meta_worker_ || !meta_queue_.empty();
+            });
+            if (stop_meta_worker_) {
+                break;
+            }
+            job = std::move(meta_queue_.front());
+            meta_queue_.pop_front();
+        }
+
+        if (cancel_scan_.load()) continue;
+
+        ComicUpsert enriched = std::move(job.base_item);
+        const std::string prev_series = enriched.series;
+        const std::string prev_author = enriched.author;
+        const std::string prev_tags = enriched.tags;
+        const std::string prev_lang = enriched.language;
+
+        populate_comic_metadata(job.file_path, enriched.format, enriched.title, enriched);
+        if (enriched.series != prev_series ||
+            enriched.author != prev_author ||
+            enriched.tags != prev_tags ||
+            enriched.language != prev_lang) {
+            flush_batch.push_back(std::move(enriched));
+            if (flush_batch.size() >= 64) {
+                db_.upsert_comics_batch(flush_batch);
+                flush_batch.clear();
+            }
+        }
+    }
+
+    if (!flush_batch.empty() && !cancel_scan_.load()) {
+        db_.upsert_comics_batch(flush_batch);
     }
 }
 

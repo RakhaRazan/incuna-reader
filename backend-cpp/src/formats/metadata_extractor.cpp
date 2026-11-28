@@ -214,6 +214,20 @@ bool extract_zip64_comicinfo(HANDLE h, int64_t file_size, std::vector<uint8_t>& 
     return false;
 }
 
+std::string la_meta_pathname_utf8(struct archive_entry* entry) {
+    if (!entry) return {};
+    if (const char* u8 = archive_entry_pathname_utf8(entry)) {
+        return std::string(u8);
+    }
+    if (const wchar_t* wp = archive_entry_pathname_w(entry)) {
+        return wide_to_utf8(std::wstring(wp));
+    }
+    if (const char* raw = archive_entry_pathname(entry)) {
+        return std::string(raw);
+    }
+    return {};
+}
+
 bool extract_libarchive_comicinfo(HANDLE h, int64_t file_size, std::vector<uint8_t>& out_xml) {
     LARGE_INTEGER zero{};
     if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) {
@@ -232,12 +246,15 @@ bool extract_libarchive_comicinfo(HANDLE h, int64_t file_size, std::vector<uint8
     archive_read_set_close_callback(a, &detail::la_win64_close_cb);
     archive_read_set_callback_data(a, &stream);
 
+    constexpr int kMaxEntriesToInspect = 20;
+    int inspected = 0;
     bool found = false;
     if (archive_read_open1(a) == ARCHIVE_OK) {
         struct archive_entry* entry = nullptr;
-        while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
-            const char* raw_name = archive_entry_pathname(entry);
-            if (raw_name && archive_entry_filetype(entry) != AE_IFDIR && is_comicinfo_xml_path(raw_name)) {
+        while (inspected < kMaxEntriesToInspect && archive_read_next_header(a, &entry) == ARCHIVE_OK) {
+            ++inspected;
+            const std::string raw_name = la_meta_pathname_utf8(entry);
+            if (!raw_name.empty() && archive_entry_filetype(entry) != AE_IFDIR && is_comicinfo_xml_path(raw_name)) {
                 const la_int64_t sz = archive_entry_size(entry);
                 if (sz <= 2LL * 1024LL * 1024LL) {
                     out_xml.clear();
@@ -273,8 +290,9 @@ bool extract_libarchive_comicinfo(HANDLE h, int64_t file_size, std::vector<uint8
 } // namespace
 
 bool extract_pdf_metadata(const std::wstring& path, ComicMetadata& out) {
+    const std::wstring long_path = to_win32_long_path(path);
     HANDLE h = CreateFileW(
-        path.c_str(),
+        long_path.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
@@ -296,6 +314,9 @@ bool extract_pdf_metadata(const std::wstring& path, ComicMetadata& out) {
     if (!GetFileSizeEx(h, &size_li) || size_li.QuadPart <= 0) {
         return false;
     }
+    if (size_li.QuadPart > static_cast<LONGLONG>((std::numeric_limits<unsigned long>::max)())) {
+        return false;
+    }
 
     detail::PdfiumRuntime::acquire();
     ScopeExit runtime_guard([]() { detail::PdfiumRuntime::release(); });
@@ -305,9 +326,7 @@ bool extract_pdf_metadata(const std::wstring& path, ComicMetadata& out) {
     stream.file_size = size_li.QuadPart;
 
     FPDF_FILEACCESS access{};
-    access.m_FileLen = (size_li.QuadPart > static_cast<int64_t>(std::numeric_limits<unsigned long>::max()))
-        ? std::numeric_limits<unsigned long>::max()
-        : static_cast<unsigned long>(size_li.QuadPart);
+    access.m_FileLen = static_cast<unsigned long>(size_li.QuadPart);
     access.m_GetBlock = &detail::win64_pdf_get_block;
     access.m_Param = &stream;
 
@@ -337,8 +356,9 @@ bool extract_archive_metadata(const std::wstring& path, ComicMetadata& out) {
         return false;
     }
 
+    const std::wstring long_path = to_win32_long_path(path);
     HANDLE h = CreateFileW(
-        path.c_str(),
+        long_path.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
@@ -357,8 +377,12 @@ bool extract_archive_metadata(const std::wstring& path, ComicMetadata& out) {
 
     std::vector<uint8_t> xml_bytes;
     bool got_xml = false;
+    constexpr int64_t kMaxSolidArchiveMetaBytes = 50LL * 1024LL * 1024LL; // 50 MB
     if (fmt == ComicFormat::Cbz || fmt == ComicFormat::Epub) {
         got_xml = extract_zip64_comicinfo(h, size_li.QuadPart, xml_bytes);
+    } else if ((fmt == ComicFormat::Cbr || fmt == ComicFormat::Cb7) &&
+               size_li.QuadPart > kMaxSolidArchiveMetaBytes) {
+        got_xml = false; // Skip expensive sequential libarchive scan on large solid archives
     } else {
         got_xml = extract_libarchive_comicinfo(h, size_li.QuadPart, xml_bytes);
     }

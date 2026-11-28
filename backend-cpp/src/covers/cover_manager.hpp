@@ -131,6 +131,7 @@ private:
     void lru_clear();
 
     bool read_from_pack(int64_t offset, int64_t size, CoverResult& out);
+    void close_pack_read_handle();
     bool append_to_pack(int64_t comic_id,
                         const std::vector<uint8_t>& data,
                         uint64_t expected_generation);
@@ -193,6 +194,10 @@ private:
     std::atomic<uint64_t> generation_{0};
     std::atomic<int64_t> indexed_count_{0};
     std::atomic<int64_t> total_to_index_{0};
+
+    // Persistent read-only Win32 HANDLE for lock-free concurrent 64-bit OVERLAPPED reads
+    mutable std::shared_mutex pack_handle_mutex_;
+    void* pack_read_handle_ = nullptr; // Win32 HANDLE (nullptr when closed)
 
     // covers.pack file I/O lock, in-memory write buffer & synchronized SQLite batch
     // (both covers.pack stream and SQLite offsets flush together once every 50 covers).

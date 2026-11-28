@@ -22,7 +22,7 @@ export function useLibraryState(i18n) {
   const [allComicsCount, setAllComicsCount] = useState(0);
   const [refreshToken, setRefreshToken] = useState(0);
   const [coverVersion, setCoverVersion] = useState(0);
-  const [theme, setTheme] = useState(() => localStorage.getItem('koma_theme') || 'dark');
+  const [theme, setTheme] = useState(() => localStorage.getItem('incuna_theme') || 'dark');
   const lastTotalComicsRef = useRef(null);
   const refreshDebounceRef = useRef(null);
   const metadataControllerRef = useRef(null);
@@ -36,7 +36,7 @@ export function useLibraryState(i18n) {
     } else {
       root.classList.remove('dark');
     }
-    localStorage.setItem('koma_theme', theme);
+    localStorage.setItem('incuna_theme', theme);
   }, [theme]);
 
   useEffect(() => {
@@ -68,10 +68,10 @@ export function useLibraryState(i18n) {
       setShelves(sh || []);
       setFolders(fl || []);
 
-      if (s?.theme && !localStorage.getItem('koma_theme')) {
+      if (s?.theme && !localStorage.getItem('incuna_theme')) {
         setTheme(s.theme);
       }
-      if (s?.language && !localStorage.getItem('koma_lang') && ['en', 'id', 'ja'].includes(s.language)) {
+      if (s?.language && !localStorage.getItem('incuna_lang') && ['en', 'id', 'ja'].includes(s.language)) {
         i18n.changeLanguage(s.language);
       }
     } catch {
@@ -113,11 +113,15 @@ export function useLibraryState(i18n) {
   const triggerRefresh = useCallback(() => setRefreshToken((v) => v + 1), []);
   const triggerCoverRefresh = useCallback(() => setCoverVersion((v) => v + 1), []);
 
-  // Lightweight 1500ms status bar poll decoupled from full library list fetches.
-  // Only refreshes the visible library slice when total_comics actually changes (1000ms debounce).
+  // Poll scan/cover-pack status ONLY while actively scanning or building covers AND not reading.
+  // Pauses completely at idle (0 wasteful 1.5s HTTP requests) and while ReaderView is open.
+  const isScanning = Boolean(scanStatus?.scanning);
+  const isBuildingCovers = Boolean(coverPackStatus?.building);
+  const isReading = Boolean(activeComic);
+  const wasScanningRef = useRef(false);
+
   useEffect(() => {
     let active = true;
-    let wasScanning = false;
     let pollController = null;
 
     const scheduleLibraryRefresh = () => {
@@ -165,14 +169,14 @@ export function useLibraryState(i18n) {
           }
         }
 
-        const isScanning = Boolean(st?.scanning);
-        if (wasScanning && !isScanning) {
+        const scanningNow = Boolean(st?.scanning);
+        if (wasScanningRef.current && !scanningNow) {
           loadMetadata();
           if (autoRefreshRef.current) {
             scheduleLibraryRefresh();
           }
         }
-        wasScanning = isScanning;
+        wasScanningRef.current = scanningNow;
       } catch {
         // ignore transient or aborted poll errors
       } finally {
@@ -182,11 +186,16 @@ export function useLibraryState(i18n) {
       }
     };
 
-    pollStatus();
-    const interval = setInterval(pollStatus, 1500);
+    if (!isReading) {
+      pollStatus();
+    }
+
+    const shouldPoll = !isReading && (isScanning || isBuildingCovers);
+    const interval = shouldPoll ? setInterval(pollStatus, 1500) : null;
+
     return () => {
       active = false;
-      clearInterval(interval);
+      if (interval) clearInterval(interval);
       if (pollController) {
         pollController.abort();
       }
@@ -195,7 +204,7 @@ export function useLibraryState(i18n) {
         refreshDebounceRef.current = null;
       }
     };
-  }, [loadMetadata]);
+  }, [loadMetadata, isReading, isScanning, isBuildingCovers, refreshToken, coverVersion]);
 
   const handleToggleTheme = async () => {
     const next = theme === 'dark' ? 'light' : 'dark';
@@ -209,7 +218,7 @@ export function useLibraryState(i18n) {
 
   const handleLanguageChange = async (lng) => {
     i18n.changeLanguage(lng);
-    localStorage.setItem('koma_lang', lng);
+    localStorage.setItem('incuna_lang', lng);
     try {
       setSettings(await api.updateSettings({ language: lng }));
     } catch {
@@ -311,6 +320,12 @@ export function useLibraryState(i18n) {
     triggerRefresh();
   };
 
+  const handleDeleteComic = async (comic) => {
+    await api.deleteComic(comic.id, true);
+    triggerRefresh();
+    loadMetadata();
+  };
+
   return {
     health,
     settings,
@@ -362,5 +377,6 @@ export function useLibraryState(i18n) {
     handleToggleHidden,
     handleAssignShelf,
     handleRemoveFromShelf,
+    handleDeleteComic,
   };
 }
