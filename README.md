@@ -7,7 +7,7 @@
 ## Key Features
 
 - **Multi-Format Engine:** Reads `.cbz`, `.zip`, `.cbr`, `.rar` (RAR5), `.cb7`, `.7z`, `.cbt`, `.tar`, `.epub`, `.pdf`, standalone images, and image folders with 64-bit Win32 streaming and a 5-page sliding RAM lookahead cache.
-- **Virtualized 60–120 FPS Library:** Smoothly handles 30,000+ comics with FTS5 full-text search, SmartViews, Custom Shelves, Folder/Series browsing with root-relative breadcrumbs, Continue Reading history, Random Unread Comic, and Multi-Select batch actions.
+- **Virtualized 60-120 FPS Library:** Smoothly handles 30,000+ comics with FTS5 full-text search, SmartViews, Custom Shelves, Folder/Series browsing with root-relative breadcrumbs, Continue Reading history, Random Unread Comic, and Multi-Select batch actions.
 - **Metadata Extractor & Filters:** Fast `ComicInfo.xml`, PDF metadata (`FPDF_GetMetaText`), and `[Author] Title (Tag)` filename parsing with click-to-filter author and tag pills.
 - **2-Mode Cover Thumbnail Engine:** Zero-thrash SATA HDD-friendly cover delivery (`covers.pack` or 0 MB `ram_only` mode) with viewport priority queuing and scroll cancellation.
 - **Pro Reader Tools:**
